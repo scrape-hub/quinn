@@ -42,7 +42,7 @@ impl QlogStream {
     }
 }
 
-/// A [`QlogStream`] that may be either dynamically disabled or compiled out entirely
+/// A `QlogStream` that may be either dynamically disabled or compiled out entirely
 #[derive(Clone, Default)]
 pub(crate) struct QlogSink {
     #[cfg(feature = "qlog")]

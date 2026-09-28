@@ -337,6 +337,11 @@ pub struct Retransmits {
 
 impl Retransmits {
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
+        self.is_empty_except_new_cids(streams) && self.new_cids.is_empty()
+    }
+
+    /// Whether nothing but NEW_CONNECTION_ID frames is pending
+    pub(super) fn is_empty_except_new_cids(&self, streams: &StreamsState) -> bool {
         !self.max_data
             && !self.max_stream_id.into_iter().any(|x| x)
             && self.reset_stream.is_empty()
@@ -346,7 +351,6 @@ impl Retransmits {
                 .iter()
                 .all(|&id| !streams.can_send_flow_control(id))
             && self.crypto.is_empty()
-            && self.new_cids.is_empty()
             && self.retire_cids.is_empty()
             && !self.ack_frequency
             && !self.handshake_done
@@ -612,7 +616,43 @@ pub(super) struct PendingAcks {
     largest_ack_eliciting_packet: Option<u64>,
     /// The largest acknowledged packet number sent in an ACK frame
     largest_acked: Option<u64>,
+    /// The smallest packet number received
+    smallest_packet: Option<u64>,
+    /// The largest packet number received when the last ACK frame was sent
+    largest_when_acked: Option<u64>,
+    /// Whether the packet [`insert_one`](Self::insert_one) most recently inserted had been
+    /// missing, i.e. arrived after a packet with a larger number
+    inserted_out_of_order: bool,
+    /// ACK frames that became due while earlier datagrams were processed, oldest first
+    queued: VecDeque<QueuedAck>,
+    /// Arrival of the first ack-eliciting packet that no ACK frame covers yet
+    unacked_since: Option<Instant>,
 }
+
+/// An ACK frame as it was due after an earlier datagram, see
+/// [`FingerprintConfig::ack_each_datagram`](crate::FingerprintConfig::ack_each_datagram)
+#[derive(Debug)]
+pub(super) struct QueuedAck {
+    pub(super) ranges: ArrayRangeSet,
+    /// When the largest acknowledged packet was received
+    pub(super) largest_received: Option<Instant>,
+    pub(super) ecn: frame::EcnCounts,
+    /// Whether other frames were ready to be sent along with it
+    pub(super) with_data: bool,
+    /// Arrival of the first ack-eliciting packet it covers
+    pub(super) unacked_since: Option<Instant>,
+    /// Number of datagrams received before it was kept; frames kept at the same moment would
+    /// have been sent together
+    pub(super) generation: u64,
+}
+
+/// Maximum number of ACK frames kept for [`PendingAcks::queue_due_ack`]; older ones are dropped,
+/// which only merges their acknowledgements into later frames
+const MAX_QUEUED_ACKS: usize = 32;
+
+/// Number of packets after a new gap in the received packet numbers that quiche acknowledges
+/// immediately (`kMaxPacketsAfterNewMissing`)
+const QUICHE_PACKETS_AFTER_NEW_MISSING: u64 = 4;
 
 impl PendingAcks {
     fn new() -> Self {
@@ -627,12 +667,160 @@ impl PendingAcks {
             largest_packet: None,
             largest_ack_eliciting_packet: None,
             largest_acked: None,
+            smallest_packet: None,
+            largest_when_acked: None,
+            inserted_out_of_order: false,
+            queued: VecDeque::new(),
+            unacked_since: None,
         }
+    }
+
+    /// Keep an ACK frame that is due but unsent, so that it is sent on its own even if more
+    /// packets arrive before the next transmission
+    ///
+    /// Treats the frame as sent: the acknowledgement state starts afresh.
+    pub(super) fn queue_due_ack(
+        &mut self,
+        ecn: frame::EcnCounts,
+        with_data: bool,
+        generation: u64,
+    ) {
+        if !self.current_ack_due() {
+            return;
+        }
+        if self.queued.len() == MAX_QUEUED_ACKS {
+            self.queued.pop_front();
+        }
+        self.queued.push_back(QueuedAck {
+            ranges: self.ranges.clone(),
+            largest_received: self.largest_packet.map(|(_, time)| time),
+            ecn,
+            with_data,
+            unacked_since: self.unacked_since,
+            generation,
+        });
+        self.acks_sent();
+    }
+
+    /// Note the arrival of an ack-eliciting packet, see [`Self::unacked_since`]
+    pub(super) fn ack_eliciting_received(&mut self, now: Instant) {
+        self.unacked_since.get_or_insert(now);
+    }
+
+    /// Arrival of the first ack-eliciting packet that no sent ACK frame covers yet, including
+    /// those in kept ACK frames
+    pub(super) fn unacked_since(&self) -> Option<Instant> {
+        let queued = self.queued.iter().filter_map(|queued| queued.unacked_since);
+        queued.chain(self.unacked_since).min()
+    }
+
+    /// Take the oldest ACK frame kept by [`Self::queue_due_ack`]
+    pub(super) fn pop_queued(&mut self) -> Option<QueuedAck> {
+        self.queued.pop_front()
+    }
+
+    /// The generation of the next kept ACK frame, see [`QueuedAck::generation`]
+    pub(super) fn next_queued_generation(&self) -> Option<u64> {
+        self.queued.front().map(|queued| queued.generation)
+    }
+
+    /// Whether the next kept ACK frame is sent without other frames
+    pub(super) fn next_queued_is_ack_only(&self) -> bool {
+        self.queued.front().is_some_and(|queued| !queued.with_data)
+    }
+
+    /// Forget kept ACK frames, e.g. when the keys of their space are discarded
+    pub(super) fn clear_queued(&mut self) {
+        self.queued.clear();
+    }
+
+    /// Whether an ack-eliciting packet has been received since the last ACK frame was sent
+    ///
+    /// quiche adds such a pending acknowledgement to every packet it sends in the space.
+    pub(super) fn has_unacked_ack_eliciting(&self) -> bool {
+        self.ack_eliciting_since_last_ack_sent > 0 && !self.ranges.is_empty()
+    }
+
+    /// Handle receipt of a new packet the way quiche's `QuicReceivedPacketManager` does
+    ///
+    /// An ACK is due after `ack_eliciting_threshold + 1` ack-eliciting packets, when the received
+    /// packet numbers have a gap and the newest range is at most four packets long, and when a
+    /// missing packet older than the largest one acknowledged arrives. Returns true if the ACK
+    /// delay timer should be armed.
+    // This method and `maybe_decimate` follow `QuicReceivedPacketManager::MaybeUpdateAckTimeout`,
+    // `HasNewMissingPackets` and `MaybeEnableAckDecimation`
+    // (quiche/quic/core/quic_received_packet_manager.cc) of QUICHE,
+    // https://github.com/google/quiche, commit 2c4a124642f095f995cd2e9e2fe10decc08df662.
+    // Copyright 2013 The Chromium Authors. All rights reserved.
+    // Use of this source code is governed by a BSD-style license (BSD-3-Clause) that can be found
+    // in licenses/quiche-LICENSE. See THIRD-PARTY-NOTICES.
+    pub(super) fn packet_received_quiche(
+        &mut self,
+        now: Instant,
+        packet_number: u64,
+        ack_eliciting: bool,
+    ) -> bool {
+        // quiche's reordering rule with its default threshold of one
+        if self.inserted_out_of_order
+            && self
+                .largest_when_acked
+                .is_some_and(|largest| largest >= 1 && packet_number < largest)
+        {
+            self.immediate_ack_required = true;
+        }
+        if !ack_eliciting {
+            self.non_ack_eliciting_since_last_ack_sent += 1;
+            return false;
+        }
+
+        self.largest_ack_eliciting_packet = self
+            .largest_ack_eliciting_packet
+            .map(|pn| pn.max(packet_number))
+            .or(Some(packet_number));
+        self.ack_eliciting_since_last_ack_sent += 1;
+        self.immediate_ack_required |=
+            self.ack_eliciting_since_last_ack_sent > self.ack_eliciting_threshold;
+        // A new gap: the numbers received form more than one range and the newest range is
+        // short. Numbers below the first packet received do not count.
+        let newest_range_len = self
+            .ranges
+            .iter()
+            .next_back()
+            .map_or(0, |r| r.end - r.start);
+        self.immediate_ack_required |=
+            self.ranges.len() > 1 && newest_range_len <= QUICHE_PACKETS_AFTER_NEW_MISSING;
+
+        if self.earliest_ack_eliciting_since_last_ack_sent.is_none() && !self.current_ack_due() {
+            self.earliest_ack_eliciting_since_last_ack_sent = Some(now);
+            return true;
+        }
+        false
     }
 
     pub(super) fn set_ack_frequency_params(&mut self, frame: &frame::AckFrequency) {
         self.ack_eliciting_threshold = frame.ack_eliciting_threshold.into_inner();
         self.reordering_threshold = frame.reordering_threshold.into_inner();
+    }
+
+    /// Acknowledge only every `packets_per_ack` ack-eliciting packets once a packet `after`
+    /// numbers beyond the smallest received one arrives, as quiche does
+    ///
+    /// Returns whether `packet` is in the decimated range. Follows quiche, see
+    /// [`Self::packet_received_quiche`].
+    pub(super) fn maybe_decimate(&mut self, packet: u64, after: u64, packets_per_ack: u64) -> bool {
+        let Some(smallest) = self.smallest_packet else {
+            return false;
+        };
+        if packet < smallest.saturating_add(after) {
+            return false;
+        }
+        self.ack_eliciting_threshold = packets_per_ack.max(1) - 1;
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn ack_eliciting_threshold(&self) -> u64 {
+        self.ack_eliciting_threshold
     }
 
     pub(super) fn set_immediate_ack_required(&mut self) {
@@ -650,6 +838,11 @@ impl PendingAcks {
 
     /// Whether any ACK frames can be sent
     pub(super) fn can_send(&self) -> bool {
+        self.current_ack_due() || !self.queued.is_empty()
+    }
+
+    /// Whether an ACK frame of the current state is due, not counting kept ones
+    pub(super) fn current_ack_due(&self) -> bool {
         self.immediate_ack_required && !self.ranges.is_empty()
     }
 
@@ -692,7 +885,7 @@ impl PendingAcks {
             self.is_out_of_order(packet_number, prev_largest_ack_eliciting, dedup);
 
         // Arm max_ack_delay timer if necessary
-        if self.earliest_ack_eliciting_since_last_ack_sent.is_none() && !self.can_send() {
+        if self.earliest_ack_eliciting_since_last_ack_sent.is_none() && !self.current_ack_due() {
             self.earliest_ack_eliciting_since_last_ack_sent = Some(now);
             return true;
         }
@@ -754,12 +947,19 @@ impl PendingAcks {
         self.ack_eliciting_since_last_ack_sent = 0;
         self.non_ack_eliciting_since_last_ack_sent = 0;
         self.earliest_ack_eliciting_since_last_ack_sent = None;
+        self.unacked_since = None;
         self.largest_acked = self.largest_ack_eliciting_packet;
+        self.largest_when_acked = self.largest_packet.map(|(pn, _)| pn);
     }
 
     /// Insert one packet that needs to be acknowledged
     pub(super) fn insert_one(&mut self, packet: u64, now: Instant) {
+        self.inserted_out_of_order = self
+            .largest_packet
+            .is_some_and(|(largest, _)| packet < largest)
+            && !self.ranges.contains(packet);
         self.ranges.insert_one(packet);
+        self.smallest_packet = Some(self.smallest_packet.map_or(packet, |x| x.min(packet)));
 
         if self.largest_packet.map_or(true, |(pn, _)| packet > pn) {
             self.largest_packet = Some((packet, now));
@@ -833,7 +1033,7 @@ impl PacketNumberFilter {
         }
     }
 
-    #[cfg(test)]
+    /// A filter that never skips a packet number
     pub(super) fn disabled() -> Self {
         Self {
             next_skipped_packet_number: u64::MAX,
@@ -1077,6 +1277,95 @@ mod test {
         acks.insert_one(2, t3);
         acks.packet_received(t3, 2, true, &dedup);
         assert_eq!(acks.ack_delay(t3), Duration::from_millis(5));
+    }
+
+    /// Every second packet, then every tenth from the 100th packet on
+    #[test]
+    fn pending_acks_decimation() {
+        let mut acks = PendingAcks::new();
+        let mut dedup = Dedup::new();
+        let now = Instant::now();
+        let mut acked = Vec::new();
+        for pn in 7..300 {
+            dedup.insert(pn);
+            acks.insert_one(pn, now);
+            let decimating = acks.maybe_decimate(pn, 100, 10);
+            assert_eq!(decimating, pn >= 107);
+            acks.packet_received(now, pn, true, &dedup);
+            if acks.can_send() {
+                acks.acks_sent();
+                acked.push(pn);
+            }
+        }
+        let before = acked.iter().filter(|pn| **pn < 107).count();
+        let after = acked.iter().filter(|pn| **pn >= 107).count();
+        assert_eq!(before, 50);
+        assert_eq!(after, 19);
+        assert!(acked.windows(2).skip(before).all(|w| w[1] - w[0] == 10));
+    }
+
+    /// quiche's rules: the first packet does not count as out of order, a new gap triggers an ACK
+    /// for up to four packets, and so does a late packet below what was acknowledged
+    #[test]
+    fn pending_acks_quiche() {
+        let now = Instant::now();
+        let mut acks = PendingAcks::new();
+        // Packet numbers followed a gap, as for a server with one counter for all spaces: an ACK
+        // becomes due after the delay
+        let receive = |acks: &mut PendingAcks, pn: u64, ack_eliciting: bool| {
+            acks.insert_one(pn, now);
+            acks.packet_received_quiche(now, pn, ack_eliciting)
+        };
+        assert!(receive(&mut acks, 7, true));
+        assert!(!acks.can_send());
+        // The second ack-eliciting packet makes it due
+        assert!(!receive(&mut acks, 8, true));
+        assert!(acks.can_send());
+        acks.acks_sent();
+
+        // Non-ack-eliciting packets never do
+        assert!(!receive(&mut acks, 9, false));
+        assert!(!acks.can_send());
+
+        // 11 opens a gap: due at once, and so are the next packets until the newest range is
+        // longer than four packets
+        for pn in 11..=14 {
+            receive(&mut acks, pn, true);
+            assert!(acks.can_send(), "{pn}");
+            acks.acks_sent();
+        }
+        receive(&mut acks, 15, true);
+        assert!(!acks.can_send());
+        receive(&mut acks, 16, true);
+        assert!(acks.can_send());
+        acks.acks_sent();
+
+        // 10 arrives late, below the largest packet acknowledged: due at once, even though it
+        // closes the gap and is the first ack-eliciting packet since the last ACK
+        receive(&mut acks, 10, true);
+        assert!(acks.can_send());
+    }
+
+    /// An ACK that is due when the next datagram arrives is kept and sent before later ones
+    #[test]
+    fn pending_acks_queue() {
+        let now = Instant::now();
+        let mut acks = PendingAcks::new();
+        let mut dedup = Dedup::new();
+        for pn in 0..5 {
+            dedup.insert(pn);
+            acks.insert_one(pn, now);
+            acks.packet_received(now, pn, true, &dedup);
+            // A new datagram arrives
+            acks.queue_due_ack(frame::EcnCounts::ZERO, false, 0);
+        }
+        assert!(acks.can_send());
+        assert!(!acks.current_ack_due());
+        let kept = std::iter::from_fn(|| acks.pop_queued())
+            .map(|queued| queued.ranges.max().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, [1, 3]);
+        assert!(!acks.can_send());
     }
 
     #[test]

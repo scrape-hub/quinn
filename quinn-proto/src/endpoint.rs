@@ -20,7 +20,7 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     coding::BufMutExt,
     config::{ClientConfig, EndpointConfig, ServerConfig},
-    connection::{Connection, ConnectionError, SideArgs},
+    connection::{Connection, ConnectionError, SideArgs, negotiate_version},
     crypto::{self, Keys, UnsupportedVersion},
     frame,
     packet::{
@@ -336,6 +336,22 @@ impl Endpoint {
         if !self.config.supported_versions.contains(&config.version) {
             return Err(ConnectError::UnsupportedVersion);
         }
+        if let Some(info) = &config
+            .transport
+            .transport_parameter_layout
+            .version_information
+        {
+            // The chosen version must be available (RFC 9368, section 3), and the endpoint must
+            // accept packets of every version the server may switch to
+            if !info.available.contains(&config.version)
+                || !info
+                    .available
+                    .iter()
+                    .all(|version| self.config.supported_versions.contains(version))
+            {
+                return Err(ConnectError::UnsupportedVersion);
+            }
+        }
 
         let remote_id = (config.initial_dst_cid_provider)();
         trace!(initial_dcid = %remote_id);
@@ -348,13 +364,14 @@ impl Endpoint {
             self.local_cid_generator.as_ref(),
             loc_cid,
             None,
+            config.version,
             &mut self.rng,
         );
         let tls = config
             .crypto
             .start_session(config.version, server_name, &params)?;
 
-        let conn = self.add_connection(
+        let mut conn = self.add_connection(
             ch,
             config.version,
             remote_id,
@@ -371,7 +388,16 @@ impl Endpoint {
                 token_store: config.token_store,
                 server_name: server_name.into(),
             },
+            None,
         );
+        conn.init_version_negotiation(config.version, params.version_information, None);
+        // Connection IDs the connection wants to announce in its first packets are issued at once,
+        // so that they are available before anything is sent
+        let early_cids = conn.early_cids_wanted();
+        if early_cids > 0 {
+            let event = self.send_new_identifiers(now, ch, early_cids);
+            conn.handle_event(event);
+        }
         Ok((ch, conn))
     }
 
@@ -589,6 +615,16 @@ impl Endpoint {
             });
         };
 
+        let (negotiated, negotiated_initial_keys) =
+            self.negotiate_version(&incoming.packet, &server_config);
+        // Moved out of `incoming` once negotiation is decided, instead of keeping
+        // `incoming.crypto` around and re-deriving the same keys again below when the version
+        // switched (RFC 9001 section 5.2: they only depend on `dst_cid`, already fixed by now).
+        // `crypto` stays available either way: for `init_version_negotiation` when switching, or
+        // for the `initial_close` below (in the client's original version) otherwise; the two
+        // never compete for it, since a switch always takes it and the failure path then reads
+        // the connection's own retained copy instead (see `original_initial_keys` below).
+        let mut crypto = Some(incoming.crypto);
         let ch = ConnectionHandle(self.connections.vacant_key());
         let loc_cid = self.new_cid(ch);
         let mut params = TransportParameters::new(
@@ -597,6 +633,7 @@ impl Endpoint {
             self.local_cid_generator.as_ref(),
             loc_cid,
             Some(&server_config),
+            negotiated,
             &mut self.rng,
         );
         params.stateless_reset_token = Some(ResetToken::new(&*self.config.reset_key, loc_cid));
@@ -614,11 +651,14 @@ impl Endpoint {
             });
         }
 
-        let tls = server_config.crypto.clone().start_session(version, &params);
+        let tls = server_config
+            .crypto
+            .clone()
+            .start_session(negotiated, &params);
         let transport_config = server_config.transport.clone();
         let mut conn = self.add_connection(
             ch,
-            version,
+            negotiated,
             dst_cid,
             loc_cid,
             src_cid,
@@ -631,7 +671,12 @@ impl Endpoint {
                 pref_addr_cid,
                 path_validated: remote_address_validated,
             },
+            negotiated_initial_keys,
         );
+        // Only a switch retains the original version's keys on the connection; otherwise `crypto`
+        // stays here, for the `initial_close` below.
+        let original_initial_keys = (negotiated != version).then(|| crypto.take().unwrap());
+        conn.init_version_negotiation(version, params.version_information, original_initial_keys);
         self.index.insert_initial(dst_cid, ch);
 
         match conn.handle_first_packet(
@@ -654,11 +699,17 @@ impl Endpoint {
             Err(e) => {
                 debug!("handshake failed: {}", e);
                 self.handle_event(ch, EndpointEvent(EndpointEventInner::Drained));
+                // Not moved into `conn` above (no switch): still held locally. Moved (switched):
+                // reuse the connection's own retained copy instead of deriving it a third time.
+                let crypto = crypto
+                    .as_ref()
+                    .or_else(|| conn.original_initial_keys())
+                    .expect("the original version's Initial keys are always available here");
                 let response = match e {
                     ConnectionError::TransportError(ref e) => Some(self.initial_close(
                         version,
                         incoming.addresses,
-                        &incoming.crypto,
+                        crypto,
                         &src_cid,
                         e.clone(),
                         buf,
@@ -668,6 +719,36 @@ impl Endpoint {
                 Err(AcceptError { cause: e, response })
             }
         }
+    }
+
+    /// Choose the version of a new connection (compatible version negotiation, RFC 9368)
+    ///
+    /// Returns the version and, if it differs from the version of the client's first flight,
+    /// that version's Initial keys (RFC 9001 section 5.2 derives them from the destination CID
+    /// alone). The original version's own Initial keys are not derived again here: the caller
+    /// already holds them (they were used to decrypt the client's first flight) and reuses that
+    /// same value as the connection's retained original-version keys.
+    fn negotiate_version(
+        &self,
+        packet: &InitialPacket,
+        server_config: &ServerConfig,
+    ) -> (u32, Option<Keys>) {
+        let header = &packet.header;
+        let negotiated = negotiate_version(
+            header.version,
+            &packet.payload,
+            &self.config.supported_versions,
+        );
+        if negotiated != header.version {
+            if let Ok(negotiated_keys) = server_config
+                .crypto
+                .initial_keys(negotiated, &header.dst_cid)
+            {
+                trace!(version = negotiated, "switching to a compatible version");
+                return (negotiated, Some(negotiated_keys));
+            }
+        }
+        (header.version, None)
     }
 
     /// Check if we should refuse a connection attempt regardless of the packet's contents
@@ -795,6 +876,7 @@ impl Endpoint {
         tls: Box<dyn crypto::Session>,
         transport_config: Arc<TransportConfig>,
         side_args: SideArgs,
+        initial_keys: Option<Keys>,
     ) -> Connection {
         let mut rng_seed = [0; 32];
         self.rng.fill_bytes(&mut rng_seed);
@@ -815,6 +897,7 @@ impl Endpoint {
             self.allow_mtud,
             rng_seed,
             side_args,
+            initial_keys,
         );
 
         let mut cids_issued = 0;
@@ -1259,8 +1342,20 @@ pub enum ConnectError {
     #[error("no default client config")]
     NoDefaultClientConfig,
     /// The local endpoint does not support the QUIC version specified in the client configuration
+    ///
+    /// Also returned if the configured `version_information` (see
+    /// [`TransportParameterLayout::version_information`](crate::TransportParameterLayout::version_information))
+    /// lists a version that is not in [`EndpointConfig::supported_versions`] or does not list the
+    /// client's version.
     #[error("unsupported QUIC version")]
     UnsupportedVersion,
+    /// The `crypto::ClientConfig` failed to configure the session
+    ///
+    /// The message is the crypto backend's own description of what went wrong, e.g. a rejected
+    /// server name, a client hello the configured extensions could not build, or a lookup a
+    /// connection-configuration callback failed.
+    #[error("crypto configuration error: {0}")]
+    CryptoConfig(String),
 }
 
 /// Error type for attempting to accept an [`Incoming`]

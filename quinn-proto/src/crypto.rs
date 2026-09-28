@@ -8,7 +8,12 @@
 //! Note that usage of any protocol (version) other than TLS 1.3 does not conform to any
 //! published versions of the specification, and will not be supported in QUIC v1.
 
-use std::{any::Any, str, sync::Arc};
+use std::{
+    any::Any,
+    str,
+    sync::Arc,
+    task::{Poll, Waker},
+};
 
 use bytes::BytesMut;
 
@@ -62,6 +67,37 @@ pub trait Session: Send + Sync + 'static {
     /// On success, returns `true` iff `self.handshake_data()` has been populated.
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError>;
 
+    /// Continue a handshake that waits for work the session performs asynchronously
+    ///
+    /// A session may finish part of the handshake outside of [`read_handshake()`], e.g. verify the
+    /// peer's certificate on another thread. While such work is outstanding, this method returns
+    /// `Poll::Pending` and arranges for `waker` to be woken once the work is done; the connection
+    /// then calls it again. `Poll::Ready(Ok(()))` means that nothing is outstanding (anymore): what
+    /// the finished work produced is then available through [`write_handshake()`],
+    /// [`is_handshaking()`], [`handshake_data()`] and [`transport_parameters()`], just as after
+    /// [`read_handshake()`]. An error aborts the handshake like an error of `read_handshake()`.
+    ///
+    /// Called by the connection while it is handshaking: after it passed handshake data to
+    /// [`read_handshake()`] and whenever its driver is polled (see
+    /// [`Connection::poll_handshake()`](crate::Connection::poll_handshake)). While work is
+    /// outstanding, `read_handshake()` may be called with more data, which the session has to
+    /// accept or buffer. The default implementation never waits.
+    ///
+    /// A call while work is still outstanding replaces any waker an earlier call registered:
+    /// only the most recently passed `waker` may ever be woken, never one from an earlier call.
+    /// An implementation that keeps the first waker and ignores later ones can stall the
+    /// connection silently if a later caller relies on that replacement.
+    ///
+    /// [`read_handshake()`]: Session::read_handshake
+    /// [`write_handshake()`]: Session::write_handshake
+    /// [`is_handshaking()`]: Session::is_handshaking
+    /// [`handshake_data()`]: Session::handshake_data
+    /// [`transport_parameters()`]: Session::transport_parameters
+    fn poll_handshake(&mut self, waker: &Waker) -> Poll<Result<(), TransportError>> {
+        let _ = waker;
+        Poll::Ready(Ok(()))
+    }
+
     /// The peer's QUIC transport parameters
     ///
     /// These are only available after the first flight from the peer has been received.
@@ -78,6 +114,26 @@ pub trait Session: Send + Sync + 'static {
 
     /// Verify the integrity of a retry packet
     fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool;
+
+    /// Switch a client session to another QUIC version during the handshake
+    ///
+    /// Compatible version negotiation (RFC 9368): a client that offers other versions in its
+    /// `version_information` transport parameter learns from the server's first Initial packet
+    /// that the server switched the connection to one of them, e.g. from QUIC version 1 to
+    /// version 2 (RFC 9369). This method is then called before any of the server's handshake data
+    /// is passed to [`read_handshake()`](Self::read_handshake). On success, [`initial_keys()`]
+    /// and every key the session derives later use `version`. If the server's packet does not
+    /// authenticate with the new Initial keys, the connection calls this method again with the
+    /// original version.
+    ///
+    /// The default implementation cannot switch and returns an error; the connection then closes
+    /// with `VERSION_NEGOTIATION_ERROR`.
+    ///
+    /// [`initial_keys()`]: Self::initial_keys
+    fn set_version(&mut self, version: u32) -> Result<(), UnsupportedVersion> {
+        let _ = version;
+        Err(UnsupportedVersion)
+    }
 
     /// Fill `output` with `output.len()` bytes of keying material derived
     /// from the [Session]'s secrets, using `label` and `context` for domain

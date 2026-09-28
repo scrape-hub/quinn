@@ -134,6 +134,73 @@ impl SendStream {
         Ok(())
     }
 
+    /// Write a buffer into this stream in its entirety and finish the stream
+    ///
+    /// Unlike [`write_all`](Self::write_all) followed by [`finish`](Self::finish), the last write
+    /// and the FIN are handed over together, so that they go out in one STREAM frame, as browsers
+    /// send a small HTTP/3 request's HEADERS and FIN.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is *not* cancellation safe. Even if this does not resolve, some prefix of `buf`
+    /// may have been written when previously polled.
+    pub async fn write_all_and_finish(&mut self, buf: &[u8]) -> Result<(), WriteError> {
+        let mut rest = buf;
+        self.write_and_finish(|s| {
+            if !rest.is_empty() {
+                let written = s.write(rest)?;
+                rest = &rest[written..];
+            }
+            Ok(rest.is_empty())
+        })
+        .await
+    }
+
+    /// Write a single [`Bytes`] into this stream in its entirety and finish the stream
+    ///
+    /// Like [`write_all_and_finish`](Self::write_all_and_finish), for a cheaply cloneable chunk.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is *not* cancellation safe. Even if this does not resolve, some bytes may have
+    /// been written when previously polled.
+    pub async fn write_chunk_and_finish(&mut self, buf: Bytes) -> Result<(), WriteError> {
+        let mut bufs = [buf];
+        self.write_and_finish(|s| {
+            if !bufs[0].is_empty() {
+                s.write_chunks(&mut bufs)?;
+            }
+            Ok(bufs[0].is_empty())
+        })
+        .await
+    }
+
+    /// Call `write` until it reports that all data has been written, then finish the stream
+    /// under the same lock
+    async fn write_and_finish(
+        &mut self,
+        mut write: impl FnMut(&mut proto::SendStream) -> Result<bool, proto::WriteError>,
+    ) -> Result<(), WriteError> {
+        loop {
+            let finished = poll_fn(|cx| {
+                self.execute_poll(cx, |s| {
+                    if !write(s)? {
+                        return Ok(false);
+                    }
+                    match s.finish() {
+                        Ok(()) => Ok(true),
+                        Err(FinishError::Stopped(code)) => Err(proto::WriteError::Stopped(code)),
+                        Err(FinishError::ClosedStream) => Err(proto::WriteError::ClosedStream),
+                    }
+                })
+            })
+            .await?;
+            if finished {
+                return Ok(());
+            }
+        }
+    }
+
     fn execute_poll<F, R>(&mut self, cx: &mut Context, write_fn: F) -> Poll<Result<R, WriteError>>
     where
         F: FnOnce(&mut proto::SendStream) -> Result<R, proto::WriteError>,

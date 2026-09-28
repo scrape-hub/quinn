@@ -20,10 +20,17 @@ pub(crate) enum Timer {
     PushNewCid = 7,
     /// When to send an immediate ACK if there are unacked ack-eliciting packets of the peer
     MaxAckDelay = 8,
+    /// When an acknowledgement of Initial or Handshake packets that is delayed as quiche delays
+    /// it becomes due
+    HandshakeAckDelay = 9,
+    /// When to process 1-RTT packets that were kept during the handshake and deferred
+    ProcessUndecryptable = 10,
+    /// When a client that holds back its Finished for the first application data sends it anyway
+    FinishedHold = 11,
 }
 
 impl Timer {
-    pub(crate) const VALUES: [Self; 9] = [
+    pub(crate) const VALUES: [Self; 12] = [
         Self::LossDetection,
         Self::Idle,
         Self::Close,
@@ -33,13 +40,16 @@ impl Timer {
         Self::Pacing,
         Self::PushNewCid,
         Self::MaxAckDelay,
+        Self::HandshakeAckDelay,
+        Self::ProcessUndecryptable,
+        Self::FinishedHold,
     ];
 }
 
 /// A table of data associated with each distinct kind of `Timer`
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct TimerTable {
-    data: [Option<Instant>; 10],
+    data: [Option<Instant>; Timer::VALUES.len()],
 }
 
 impl TimerTable {

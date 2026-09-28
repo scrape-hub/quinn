@@ -1,0 +1,63 @@
+Third-party notices
+===================
+
+Quinn is licensed under the MIT license or the Apache License, Version 2.0, at
+your option (LICENSE-MIT, LICENSE-APACHE).
+
+This fork adds options that reproduce the QUIC wire behaviour of Chromium and
+Firefox (see `FingerprintConfig` in quinn-proto). Most of that code is Quinn's
+own: it was written to match packet captures of the browsers and the behaviour
+their QUIC implementations document in their sources. Comments such as "as
+quiche does" or "as neqo does" mark code of this kind.
+
+The parts listed below go further: they translate code of these
+implementations or closely follow its structure. They are additionally covered
+by the licence of the respective project, whose full text is in the licenses/
+directory. The files concerned name their source in a comment.
+
+
+QUICHE, the QUIC implementation of Chromium
+-------------------------------------------
+
+Source:    https://github.com/google/quiche
+           commit 2c4a124642f095f995cd2e9e2fe10decc08df662
+Copyright: Copyright 2015 The Chromium Authors. All rights reserved. (LICENSE)
+           Copyright (c) 2012 The Chromium Authors. All rights reserved.
+             (quiche/quic/core/quic_packet_creator.cc)
+           Copyright 2013 The Chromium Authors. All rights reserved.
+             (quiche/quic/core/quic_received_packet_manager.cc)
+           Copyright (c) 2021 The Chromium Authors. All rights reserved.
+             (quiche/quic/core/quic_chaos_protector.cc)
+Licence:   BSD-3-Clause, see licenses/quiche-LICENSE
+
+Used in:
+
+- quinn-proto/src/connection/crypto_framing.rs
+  - `chaos_layout`: `QuicChaosProtector` (SplitCryptoFrame, AddPingFrames,
+    SpreadPadding, ReorderFrames), quiche/quic/core/quic_chaos_protector.cc
+  - `multi_packet_split` and `chaos_protect`:
+    `QuicPacketCreator::MultiPacketChaosProtect` and
+    `QuicPacketCreator::ConsumeCryptoDataToFillCurrentPacket`,
+    quiche/quic/core/quic_packet_creator.cc
+- quinn-proto/src/connection/spaces.rs
+  - `PendingAcks::packet_received_quiche` and `PendingAcks::maybe_decimate`:
+    `QuicReceivedPacketManager::MaybeUpdateAckTimeout`, `HasNewMissingPackets`
+    and `MaybeEnableAckDecimation`,
+    quiche/quic/core/quic_received_packet_manager.cc
+
+
+neqo, the QUIC implementation of Firefox
+----------------------------------------
+
+Source:    https://github.com/mozilla/neqo
+           tag v0.30.1 (commit e2a2a7459b8b51778b50209251a61fc5ca020893)
+Copyright: Copyright (c) 2019 Mozilla Foundation
+Licence:   MIT or Apache-2.0, at your option, see licenses/neqo-LICENSE-MIT and
+           licenses/neqo-LICENSE-APACHE
+
+Used in:
+
+- quinn-proto/src/connection/crypto_framing.rs
+  - `find_sni`: `find_sni`, neqo-transport/src/sni.rs
+  - `slice_sni` and `limit_chunks`: `CryptoStreams::write_frame` and its
+    `limit_chunks`, neqo-transport/src/crypto.rs

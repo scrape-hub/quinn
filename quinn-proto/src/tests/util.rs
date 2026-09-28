@@ -142,6 +142,9 @@ impl Pair {
         let _guard = span.enter();
         self.client.drive(self.time, self.server.addr);
         for (packet, buffer) in self.client.outbound.drain(..) {
+            if let Some(sent) = &mut self.client.sent_datagrams {
+                sent.push(buffer.clone());
+            }
             let packet_size = packet_size(&packet, &buffer);
             if packet_size > self.mtu {
                 info!(packet_size, "dropping packet (max size exceeded)");
@@ -171,6 +174,9 @@ impl Pair {
         let _guard = span.enter();
         self.server.drive(self.time, self.client.addr);
         for (packet, buffer) in self.server.outbound.drain(..) {
+            if let Some(sent) = &mut self.server.sent_datagrams {
+                sent.push(buffer.clone());
+            }
             let packet_size = packet_size(&packet, &buffer);
             if packet_size > self.mtu {
                 info!(packet_size, "dropping packet (max size exceeded)");
@@ -210,10 +216,13 @@ impl Pair {
     pub(super) fn begin_connect(&mut self, config: ClientConfig) -> ConnectionHandle {
         let span = info_span!("client");
         let _guard = span.enter();
-        let (client_ch, client_conn) = self
+        let (client_ch, mut client_conn) = self
             .client
             .connect(self.time, config, self.server.addr, "localhost")
             .unwrap();
+        if self.client.log_sent_packets {
+            client_conn.log_sent_packets();
+        }
         self.client.connections.insert(client_ch, client_conn);
         client_ch
     }
@@ -297,6 +306,10 @@ pub(super) struct TestEndpoint {
     conn_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
     pub(super) captured_packets: Vec<Vec<u8>>,
     pub(super) capture_inbound_packets: bool,
+    /// Every datagram sent by this endpoint, if enabled
+    pub(super) sent_datagrams: Option<Vec<Bytes>>,
+    /// Whether this endpoint's connections log the packets they send
+    pub(super) log_sent_packets: bool,
     pub(super) handle_incoming: Box<dyn FnMut(&Incoming) -> IncomingConnectionBehavior>,
     pub(super) waiting_incoming: Vec<Incoming>,
 }
@@ -341,6 +354,8 @@ impl TestEndpoint {
             conn_events: HashMap::default(),
             captured_packets: Vec::new(),
             capture_inbound_packets: false,
+            sent_datagrams: None,
+            log_sent_packets: false,
             handle_incoming: Box::new(|_| IncomingConnectionBehavior::Accept),
             waiting_incoming: Vec::new(),
         }
@@ -404,6 +419,18 @@ impl TestEndpoint {
         }
     }
 
+    /// Hand received datagrams to the connections without letting them transmit
+    pub(super) fn deliver_incoming(&mut self, now: Instant, remote: SocketAddr) {
+        self.drive_incoming(now, remote);
+        for (ch, events) in self.conn_events.drain() {
+            if let Some(conn) = self.connections.get_mut(&ch) {
+                for event in events {
+                    conn.handle_event(event);
+                }
+            }
+        }
+    }
+
     pub(super) fn drive_outgoing(&mut self, now: Instant) {
         let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
         let mut buf = Vec::with_capacity(buffer_size);
@@ -425,6 +452,7 @@ impl TestEndpoint {
                 while let Some(event) = conn.poll_endpoint_events() {
                     endpoint_events.push((*ch, event));
                 }
+                conn.poll_handshake(now, &test_waker());
                 while let Some(transmit) = conn.poll_transmit(now, MAX_DATAGRAMS, &mut buf) {
                     let size = transmit.size;
                     self.outbound.extend(split_transmit(transmit, &buf[..size]));
@@ -472,7 +500,10 @@ impl TestEndpoint {
     ) -> Result<ConnectionHandle, ConnectionError> {
         let mut buf = Vec::new();
         match self.endpoint.accept(incoming, now, &mut buf, None) {
-            Ok((ch, conn)) => {
+            Ok((ch, mut conn)) => {
+                if self.log_sent_packets {
+                    conn.log_sent_packets();
+                }
                 self.connections.insert(ch, conn);
                 self.accepted = Some(Ok(ch));
                 Ok(ch)
@@ -597,7 +628,7 @@ pub(super) fn server_crypto_with_cert(
     server_crypto_inner(Some((cert, key)), None)
 }
 
-fn server_crypto_inner(
+pub(super) fn server_crypto_inner(
     identity: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
     alpn: Option<Vec<Vec<u8>>>,
 ) -> QuicServerConfig {
@@ -640,7 +671,7 @@ pub(super) fn client_crypto_with_alpn(protocols: Vec<Vec<u8>>) -> QuicClientConf
     client_crypto_inner(None, Some(protocols))
 }
 
-fn client_crypto_inner(
+pub(super) fn client_crypto_inner(
     certs: Option<Vec<CertificateDer<'static>>>,
     alpn: Option<Vec<Vec<u8>>>,
 ) -> QuicClientConfig {
@@ -660,6 +691,15 @@ fn client_crypto_inner(
     }
 
     inner.try_into().unwrap()
+}
+
+/// A waker for tests, which drive connections without tasks
+pub(super) fn test_waker() -> std::task::Waker {
+    struct Noop;
+    impl std::task::Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    std::task::Waker::from(Arc::new(Noop))
 }
 
 pub(super) fn min_opt<T: Ord>(x: Option<T>, y: Option<T>) -> Option<T> {

@@ -945,3 +945,726 @@ async fn stream_stopped_2() {
     let res = stopped.await;
     assert_eq!(res, Ok(Ok(None)));
 }
+
+/// Transport and endpoint settings with the wire behaviour of Chrome (`chrome`) or Firefox
+///
+/// Only the options that change how packets are sent; the transport parameters are covered by
+/// quinn-proto's tests.
+fn browser_like(chrome: bool) -> (TransportConfig, EndpointConfig) {
+    let mut fingerprint = crate::FingerprintConfig::default();
+    fingerprint
+        .early_key_update(false)
+        .ack_each_datagram(true)
+        .trailing_ping(true);
+    let (cid_len, mtu) = match chrome {
+        true => {
+            fingerprint
+                .packet_numbering(crate::PacketNumbering::Shared { first: 1 })
+                .initial_padding(crate::InitialPadding::Frames { size: 1250 })
+                .crypto_framing(crate::CryptoFraming::ChaosProtection)
+                .spin_bit(crate::SpinBit::Zero)
+                .ack_decimation(Some(crate::AckDecimation::default()))
+                .ack_policy(crate::AckPolicy::Quiche)
+                .packet_padding(crate::PacketPadding::Leading)
+                .buffered_packet_processing(crate::BufferedPacketProcessing::AfterFirst1rttData);
+            (0, 1250)
+        }
+        false => {
+            fingerprint
+                .packet_numbering(crate::PacketNumbering::Sequential {
+                    first_initial: crate::FirstPacketNumber::Fixed(321),
+                })
+                .initial_padding(crate::InitialPadding::TrailingZeros { size: 1252 })
+                .crypto_framing(crate::CryptoFraming::SniSlicing)
+                .spin_bit(crate::SpinBit::Random)
+                .early_connection_ids(true);
+            (3, 1252)
+        }
+    };
+    let mut transport = TransportConfig::default();
+    transport
+        .initial_mtu(mtu)
+        .mtu_discovery_config(None)
+        .fingerprint(fingerprint);
+    let mut endpoint = EndpointConfig::default();
+    endpoint
+        .cid_generator(move || Box::new(RandomConnectionIdGenerator::new(cid_len)))
+        .grease_quic_bit(false);
+    (transport, endpoint)
+}
+
+/// Browser-like clients complete handshakes, transfers and 0-RTT resumption with a Quinn server
+/// over real loopback sockets
+#[tokio::test]
+async fn browser_like_clients() {
+    let _guard = subscribe();
+    for (name, (transport, endpoint_config)) in [
+        ("chrome", browser_like(true)),
+        ("firefox", browser_like(false)),
+    ] {
+        info!(name, "testing browser-like client");
+        let factory = EndpointFactory::new();
+        let server = factory.endpoint();
+        let server_addr = server.local_addr().unwrap();
+        let server_task = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let incoming = server.accept().await.unwrap().accept().unwrap();
+                    let (connection, _) = incoming.into_0rtt().unwrap_or_else(|_| unreachable!());
+                    let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                    let request = recv.read_to_end(usize::MAX).await.unwrap();
+                    assert_eq!(request, b"GET /");
+                    send.write_all(&vec![0x42; 500_000]).await.unwrap();
+                    send.finish().unwrap();
+                    connection.closed().await;
+                }
+            })
+        };
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(factory.cert.cert.der().clone()).unwrap();
+        let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        client_config
+            .transport_config(Arc::new(transport))
+            .initial_dst_cid_provider(Arc::new(|| {
+                use crate::ConnectionIdGenerator as _;
+                RandomConnectionIdGenerator::new(8).generate_cid()
+            }));
+        let client = Endpoint::new(
+            endpoint_config,
+            None,
+            UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+            Arc::new(TokioRuntime),
+        )
+        .unwrap();
+
+        async fn request(connection: &crate::Connection) {
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            send.write_all(b"GET /").await.unwrap();
+            send.finish().unwrap();
+            let response = recv.read_to_end(usize::MAX).await.unwrap();
+            assert_eq!(response.len(), 500_000);
+        }
+
+        // Full handshake
+        let connection = client
+            .connect_with(client_config.clone(), server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        request(&connection).await;
+        // A PING on the application's initiative, as Chrome sends them to keep a connection alive
+        let pings = connection.stats().frame_tx.ping;
+        connection.ping();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while connection.stats().frame_tx.ping == pings {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name}: no PING sent"));
+        connection.close(0u32.into(), b"done");
+
+        // Resumption, with the request in 0-RTT
+        let (connection, accepted) = client
+            .connect_with(client_config, server_addr, "localhost")
+            .unwrap()
+            .into_0rtt()
+            .unwrap_or_else(|_| panic!("{name}: missing 0-RTT keys"));
+        request(&connection).await;
+        assert!(accepted.await, "{name}: 0-RTT rejected");
+        connection.close(0u32.into(), b"done");
+
+        server_task.await.unwrap();
+        client.wait_idle().await;
+    }
+}
+
+/// A client session that verifies the server's certificate on another thread: the handshake data
+/// after the ServerHello waits until a worker thread has slept for `delay` and woken the
+/// connection
+struct ThreadedSession {
+    inner: Box<dyn proto::crypto::Session>,
+    delay: Duration,
+    handshake_keys: bool,
+    held: Vec<Vec<u8>>,
+    worker: Option<Worker>,
+}
+
+/// Whether the worker thread is done, and the waker to wake then
+type Worker = Arc<std::sync::Mutex<(bool, Option<std::task::Waker>)>>;
+
+struct ThreadedClientConfig {
+    inner: Arc<QuicClientConfig>,
+    delay: Duration,
+}
+
+impl proto::crypto::ClientConfig for ThreadedClientConfig {
+    fn start_session(
+        self: Arc<Self>,
+        version: u32,
+        server_name: &str,
+        params: &proto::transport_parameters::TransportParameters,
+    ) -> Result<Box<dyn proto::crypto::Session>, proto::ConnectError> {
+        Ok(Box::new(ThreadedSession {
+            inner: self
+                .inner
+                .clone()
+                .start_session(version, server_name, params)?,
+            delay: self.delay,
+            handshake_keys: false,
+            held: Vec::new(),
+            worker: None,
+        }))
+    }
+}
+
+impl proto::crypto::Session for ThreadedSession {
+    fn initial_keys(
+        &self,
+        dst_cid: &crate::ConnectionId,
+        side: crate::Side,
+    ) -> proto::crypto::Keys {
+        self.inner.initial_keys(dst_cid, side)
+    }
+
+    fn handshake_data(&self) -> Option<Box<dyn std::any::Any>> {
+        self.inner.handshake_data()
+    }
+
+    fn peer_identity(&self) -> Option<Box<dyn std::any::Any>> {
+        self.inner.peer_identity()
+    }
+
+    fn early_crypto(
+        &self,
+    ) -> Option<(
+        Box<dyn proto::crypto::HeaderKey>,
+        Box<dyn proto::crypto::PacketKey>,
+    )> {
+        self.inner.early_crypto()
+    }
+
+    fn early_data_accepted(&self) -> Option<bool> {
+        self.inner.early_data_accepted()
+    }
+
+    fn is_handshaking(&self) -> bool {
+        self.inner.is_handshaking()
+    }
+
+    fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, proto::TransportError> {
+        if !self.handshake_keys {
+            return self.inner.read_handshake(buf);
+        }
+        self.held.push(buf.to_vec());
+        Ok(false)
+    }
+
+    fn poll_handshake(
+        &mut self,
+        waker: &std::task::Waker,
+    ) -> std::task::Poll<Result<(), proto::TransportError>> {
+        use std::task::Poll;
+        if self.held.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        let worker = self.worker.get_or_insert_with(|| {
+            let state = Arc::new(std::sync::Mutex::new((false, None::<std::task::Waker>)));
+            let shared = state.clone();
+            let delay = self.delay;
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let mut state = shared.lock().unwrap();
+                state.0 = true;
+                if let Some(waker) = state.1.take() {
+                    waker.wake();
+                }
+            });
+            state
+        });
+        {
+            let mut state = worker.lock().unwrap();
+            if !state.0 {
+                state.1 = Some(waker.clone());
+                return Poll::Pending;
+            }
+        }
+        self.worker = None;
+        for data in std::mem::take(&mut self.held) {
+            self.inner.read_handshake(&data)?;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn transport_parameters(
+        &self,
+    ) -> Result<Option<proto::transport_parameters::TransportParameters>, proto::TransportError>
+    {
+        self.inner.transport_parameters()
+    }
+
+    fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<proto::crypto::Keys> {
+        let keys = self.inner.write_handshake(buf);
+        self.handshake_keys |= keys.is_some();
+        keys
+    }
+
+    fn next_1rtt_keys(
+        &mut self,
+    ) -> Option<proto::crypto::KeyPair<Box<dyn proto::crypto::PacketKey>>> {
+        self.inner.next_1rtt_keys()
+    }
+
+    fn is_valid_retry(
+        &self,
+        orig_dst_cid: &crate::ConnectionId,
+        header: &[u8],
+        payload: &[u8],
+    ) -> bool {
+        self.inner.is_valid_retry(orig_dst_cid, header, payload)
+    }
+
+    fn export_keying_material(
+        &self,
+        output: &mut [u8],
+        label: &[u8],
+        context: &[u8],
+    ) -> Result<(), proto::crypto::ExportKeyingMaterialError> {
+        self.inner.export_keying_material(output, label, context)
+    }
+}
+
+/// A session that finishes the handshake on another thread wakes the connection driver, which
+/// completes the handshake
+#[tokio::test]
+async fn async_certificate_verification() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint();
+    let server_addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let mut send = connection.open_uni().await.unwrap();
+        send.write_all(b"hello").await.unwrap();
+        send.finish().unwrap();
+        connection.closed().await;
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(factory.cert.cert.der().clone()).unwrap();
+    let client_crypto = rustls::ClientConfig::builder_with_provider(default_provider().into())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let delay = Duration::from_millis(20);
+    let client_config = ClientConfig::new(Arc::new(ThreadedClientConfig {
+        inner: Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()),
+        delay,
+    }));
+    let client = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    let start = Instant::now();
+    let connection = client
+        .connect_with(client_config, server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(start.elapsed() >= delay);
+    let mut recv = connection.accept_uni().await.unwrap();
+    assert_eq!(recv.read_to_end(usize::MAX).await.unwrap(), b"hello");
+    connection.close(0u32.into(), b"done");
+    server_task.await.unwrap();
+    client.wait_idle().await;
+}
+
+/// Writes made under a `TransmitHold` leave in one packet even on a multi-threaded runtime,
+/// `write_all_and_finish` sends data and FIN in one STREAM frame, and `close_transport` reaches
+/// the peer as a transport-level close
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batched_writes_and_transport_close() {
+    const RUNS: usize = 30;
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.mtu_discovery_config(None);
+    let endpoint = EndpointFactory::new().endpoint_with_config(transport);
+    let server_addr = endpoint.local_addr().unwrap();
+
+    let (requests_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let server = endpoint.clone();
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        // Keep the send halves so that the server sends nothing the client has to acknowledge
+        let mut send_halves = Vec::new();
+        for _ in 0..2 * RUNS + 1 {
+            let (send, mut recv) = connection.accept_bi().await.unwrap();
+            let request = recv.read_to_end(usize::MAX).await.unwrap();
+            send_halves.push(send);
+            requests_tx.send(request).unwrap();
+        }
+        connection.closed().await
+    });
+
+    let connection = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    // Long-lived unidirectional streams, like HTTP/3's control and QPACK encoder streams
+    let mut control = connection.open_uni().await.unwrap();
+    let mut encoder = connection.open_uni().await.unwrap();
+    control.write_all(b"settings").await.unwrap();
+    encoder.write_all(b"capacity").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut streams = Vec::new();
+    for _ in 0..RUNS {
+        let before = connection.stats();
+        {
+            let _hold = connection.hold_transmit();
+            control.write_all(b"priority update").await.unwrap();
+            encoder.write_all(b"insert").await.unwrap();
+            let (mut send, recv) = connection.open_bi().await.unwrap();
+            send.write_all(b"headers").await.unwrap();
+            send.finish().unwrap();
+            streams.push((send, recv));
+        }
+        assert_eq!(requests.recv().await.unwrap(), b"headers");
+        let after = connection.stats();
+        assert_eq!(after.frame_tx.stream - before.frame_tx.stream, 3);
+        assert_eq!(after.udp_tx.datagrams - before.udp_tx.datagrams, 1);
+    }
+
+    for _ in 0..RUNS {
+        let before = connection.stats();
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        send.write_all_and_finish(b"headers").await.unwrap();
+        streams.push((send, recv));
+        assert_eq!(requests.recv().await.unwrap(), b"headers");
+        let after = connection.stats();
+        assert_eq!(after.frame_tx.stream - before.frame_tx.stream, 1);
+        assert_eq!(after.udp_tx.datagrams - before.udp_tx.datagrams, 1);
+    }
+
+    // A leaked hold delays transmission by at most 10 ms
+    std::mem::forget(connection.hold_transmit());
+    let (mut send, recv) = connection.open_bi().await.unwrap();
+    send.write_all_and_finish(b"late").await.unwrap();
+    streams.push((send, recv));
+    let late = tokio::time::timeout(Duration::from_secs(1), requests.recv()).await;
+    assert_eq!(late.unwrap().unwrap(), b"late");
+
+    connection.close_transport(
+        proto::TransportErrorCode::NO_ERROR,
+        Some(crate::VarInt::from_u32(0)),
+        b"70:net error",
+    );
+    match server_task.await.unwrap() {
+        crate::ConnectionError::ConnectionClosed(close) => {
+            assert_eq!(close.error_code, proto::TransportErrorCode::NO_ERROR);
+            assert_eq!(&close.reason[..], b"70:net error");
+        }
+        e => panic!("unexpected close: {e}"),
+    }
+    endpoint.wait_idle().await;
+}
+
+/// An abandoned connection sends nothing: no `CONNECTION_CLOSE`, not when its last handle is
+/// dropped, and not while its endpoint shuts down
+#[tokio::test]
+async fn abandon_sends_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint();
+    let server_addr = server.local_addr().unwrap();
+    let client = factory.endpoint();
+
+    // A relay between client and server counts the client's datagrams
+    let relay = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay_addr = relay.local_addr().unwrap();
+    let from_client = Arc::new(AtomicUsize::new(0));
+    let relay_task = tokio::spawn({
+        let from_client = from_client.clone();
+        async move {
+            let mut buf = vec![0; 65_536];
+            let mut client_addr = None;
+            loop {
+                let (len, from) = relay.recv_from(&mut buf).await.unwrap();
+                let to = match from == server_addr {
+                    true => client_addr,
+                    false => {
+                        from_client.fetch_add(1, Relaxed);
+                        client_addr = Some(from);
+                        Some(server_addr)
+                    }
+                };
+                if let Some(to) = to {
+                    relay.send_to(&buf[..len], to).await.unwrap();
+                }
+            }
+        }
+    });
+
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let (send, mut recv) = connection.accept_bi().await.unwrap();
+        let mut buf = [0; 7];
+        recv.read_exact(&mut buf).await.unwrap();
+        (connection, send, recv)
+    });
+    let connection = client
+        .connect(relay_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    send.write_all(b"request").await.unwrap();
+    let (server_connection, _server_send, _server_recv) = server_task.await.unwrap();
+    // Let the last acknowledgements pass
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sent = from_client.load(Relaxed);
+    let tx = connection.stats().udp_tx.datagrams;
+
+    connection.abandon();
+    assert_eq!(
+        connection.close_reason(),
+        Some(crate::ConnectionError::LocallyClosed)
+    );
+    assert!(matches!(
+        send.write_all(b"late").await,
+        Err(crate::WriteError::ConnectionLost(
+            crate::ConnectionError::LocallyClosed
+        ))
+    ));
+    assert!(matches!(
+        recv.read(&mut [0; 8]).await,
+        Err(crate::ReadError::ConnectionLost(
+            crate::ConnectionError::LocallyClosed
+        ))
+    ));
+    assert_eq!(connection.stats().udp_tx.datagrams, tx);
+    drop((send, recv, connection));
+    // The endpoint forgets the connection at once
+    tokio::time::timeout(Duration::from_secs(1), client.wait_idle())
+        .await
+        .unwrap();
+    assert_eq!(client.open_connections(), 0);
+    drop(client);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(from_client.load(Relaxed), sent);
+    assert_eq!(server_connection.close_reason(), None);
+    relay_task.abort();
+}
+
+/// A client that holds its Finished for the first application data gets its connection while the
+/// Finished waits, and its first write releases it. The handshake is resumed without 0-RTT, as
+/// with Cloudflare's session tickets, so that it completes as soon as the server's flight is
+/// processed.
+///
+/// Depends on timing: the Finished waits at most 1 ms after the server's flight arrived, which a
+/// busy machine exceeds before the application runs. Run it on its own with
+/// `cargo test -p quinn --lib -- --ignored finished_waits_for_first_write`.
+#[tokio::test]
+#[ignore = "timing-dependent; see the documentation"]
+async fn finished_waits_for_first_write() {
+    let _guard = subscribe();
+    for hold in [true, false] {
+        let factory = EndpointFactory::new();
+        let key = PrivateKeyDer::Pkcs8(factory.cert.signing_key.serialize_der().into());
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(default_provider()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![factory.cert.cert.der().clone()], key)
+            .unwrap();
+        tls.max_early_data_size = 0;
+        let crypto = proto::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+        let server = Endpoint::server(
+            crate::ServerConfig::with_crypto(Arc::new(crypto)),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        )
+        .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let connection = server.accept().await.unwrap().await.unwrap();
+                let mut recv = connection.accept_uni().await.unwrap();
+                received.push(recv.read_to_end(usize::MAX).await.unwrap());
+                connection.close(0u32.into(), b"done");
+            }
+            received
+        });
+
+        let mut fingerprint = crate::FingerprintConfig::default();
+        fingerprint.finished_with_first_data(hold);
+        let mut transport = TransportConfig::default();
+        transport.fingerprint(fingerprint);
+        let client = factory.endpoint_with_config(transport);
+        for resumed in [false, true] {
+            let connection = client
+                .connect(server_addr, "localhost")
+                .unwrap()
+                .await
+                .unwrap();
+            // Only the ClientHello has been sent if the Finished waits
+            let crypto_frames = connection.stats().frame_tx.crypto;
+            if resumed {
+                assert_eq!(crypto_frames, if hold { 1 } else { 2 });
+            }
+            let mut control = connection.open_uni().await.unwrap();
+            control.write_all_and_finish(b"settings").await.unwrap();
+            connection.closed().await;
+            assert_eq!(connection.stats().frame_tx.crypto, 2);
+        }
+        assert_eq!(server_task.await.unwrap(), [b"settings"; 2]);
+        client.wait_idle().await;
+    }
+}
+
+/// A runtime that counts timers armed for deadlines that have already passed
+#[derive(Debug, Default)]
+struct DueTimerAudit(Arc<std::sync::atomic::AtomicUsize>);
+
+impl DueTimerAudit {
+    fn record(counter: &std::sync::atomic::AtomicUsize, deadline: Instant) {
+        if deadline <= crate::Runtime::now(&TokioRuntime) {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl crate::Runtime for DueTimerAudit {
+    fn new_timer(&self, t: Instant) -> std::pin::Pin<Box<dyn crate::AsyncTimer>> {
+        Self::record(&self.0, t);
+        Box::pin(AuditedTimer {
+            inner: crate::Runtime::new_timer(&TokioRuntime, t),
+            counter: self.0.clone(),
+        })
+    }
+
+    fn spawn(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+        crate::Runtime::spawn(&TokioRuntime, future)
+    }
+
+    fn wrap_udp_socket(
+        &self,
+        t: std::net::UdpSocket,
+    ) -> io::Result<Arc<dyn crate::AsyncUdpSocket>> {
+        crate::Runtime::wrap_udp_socket(&TokioRuntime, t)
+    }
+
+    fn now(&self) -> Instant {
+        crate::Runtime::now(&TokioRuntime)
+    }
+}
+
+#[derive(Debug)]
+struct AuditedTimer {
+    inner: std::pin::Pin<Box<dyn crate::AsyncTimer>>,
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::AsyncTimer for AuditedTimer {
+    fn reset(mut self: std::pin::Pin<&mut Self>, i: Instant) {
+        DueTimerAudit::record(&self.counter, i);
+        self.inner.as_mut().reset(i)
+    }
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context,
+    ) -> std::task::Poll<()> {
+        self.inner.as_mut().poll(cx)
+    }
+}
+
+/// Deadlines that are already due are handled at once instead of through a runtime timer,
+/// which would round them up to the runtime's next tick; after an asynchronous handshake, the
+/// kept 1-RTT packets are processed right after the first 1-RTT data, with such a deadline
+#[tokio::test]
+async fn due_deadlines_skip_the_runtime_timer() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint();
+    let server_addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let mut recv = connection.accept_uni().await.unwrap();
+        assert_eq!(recv.read_to_end(usize::MAX).await.unwrap(), b"settings");
+        connection.closed().await;
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(factory.cert.cert.der().clone()).unwrap();
+    let client_crypto = rustls::ClientConfig::builder_with_provider(default_provider().into())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut fingerprint = crate::FingerprintConfig::default();
+    fingerprint.buffered_packet_processing(crate::BufferedPacketProcessing::AfterFirst1rttData);
+    let mut transport = TransportConfig::default();
+    transport.fingerprint(fingerprint);
+    let mut client_config = ClientConfig::new(Arc::new(ThreadedClientConfig {
+        inner: Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()),
+        delay: Duration::from_millis(5),
+    }));
+    client_config.transport_config(Arc::new(transport));
+    let audit = DueTimerAudit::default();
+    let due_timers = audit.0.clone();
+    let client = Endpoint::new(
+        EndpointConfig::default(),
+        None,
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+        Arc::new(audit),
+    )
+    .unwrap();
+    let connection = client
+        .connect_with(client_config, server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut send = connection.open_uni().await.unwrap();
+    send.write_all_and_finish(b"settings").await.unwrap();
+    send.stopped().await.unwrap();
+    connection.close(0u32.into(), b"done");
+    server_task.await.unwrap();
+    client.wait_idle().await;
+    assert_eq!(due_timers.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// A transmit hold that is kept too long ends after 2 ms
+#[tokio::test]
+async fn transmit_hold_is_bounded() {
+    let _guard = subscribe();
+    let endpoint = endpoint();
+    let server = endpoint.clone();
+    let server_task = tokio::spawn(async move {
+        let connection = server.accept().await.unwrap().await.unwrap();
+        let mut recv = connection.accept_uni().await.unwrap();
+        recv.read_to_end(usize::MAX).await.unwrap()
+    });
+    let connection = endpoint
+        .connect(endpoint.local_addr().unwrap(), "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let hold = connection.hold_transmit();
+    let mut send = connection.open_uni().await.unwrap();
+    let start = Instant::now();
+    send.write_all_and_finish(b"held").await.unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(1), server_task)
+        .await
+        .expect("data held back for too long")
+        .unwrap();
+    assert_eq!(received, b"held");
+    // Well below the timeout, allowing for a coarse runtime timer
+    assert!(start.elapsed() < Duration::from_millis(100));
+    drop(hold);
+    connection.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+}

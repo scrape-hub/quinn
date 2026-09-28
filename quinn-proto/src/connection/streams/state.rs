@@ -127,8 +127,10 @@ pub struct StreamsState {
     ///
     /// Note this may be less than `unacked_data` if the user has set a new value.
     pub(super) send_window: u64,
-    /// Configured upper bound for how much unacked data the peer can send us per stream
-    pub(super) stream_receive_window: u64,
+    /// Configured upper bound for how much unacked data the peer can send us per stream, for
+    /// bidirectional streams opened locally, bidirectional streams opened by the peer and
+    /// unidirectional streams, in this order
+    stream_receive_windows: [u64; 3],
 
     // Pertinent state from the TransportParameters supplied by the peer
     initial_max_stream_data_uni: VarInt,
@@ -140,6 +142,8 @@ pub struct StreamsState {
 }
 
 impl StreamsState {
+    /// `stream_receive_windows` applies to bidirectional streams opened locally, bidirectional
+    /// streams opened by the peer and unidirectional streams, in this order
     #[allow(unreachable_pub)] // fuzzing only
     pub fn new(
         side: Side,
@@ -147,7 +151,7 @@ impl StreamsState {
         max_remote_bi: VarInt,
         send_window: u64,
         receive_window: VarInt,
-        stream_receive_window: VarInt,
+        stream_receive_windows: [VarInt; 3],
     ) -> Self {
         let mut this = Self {
             side,
@@ -176,7 +180,7 @@ impl StreamsState {
             data_recvd: 0,
             unacked_data: 0,
             send_window,
-            stream_receive_window: stream_receive_window.into(),
+            stream_receive_windows: stream_receive_windows.map(u64::from),
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
@@ -190,6 +194,15 @@ impl StreamsState {
         }
 
         this
+    }
+
+    /// Upper bound for how much unacked data the peer can send us on stream `id`
+    pub(super) fn stream_receive_window(&self, id: StreamId) -> u64 {
+        match id.dir() {
+            Dir::Bi if id.initiator() == self.side => self.stream_receive_windows[0],
+            Dir::Bi => self.stream_receive_windows[1],
+            Dir::Uni => self.stream_receive_windows[2],
+        }
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
@@ -261,11 +274,8 @@ impl StreamsState {
             e
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        let window = self.stream_receive_window(id);
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(window)) {
             Some(rs) => rs,
             None => {
                 trace!("dropping frame for closed stream");
@@ -315,11 +325,8 @@ impl StreamsState {
             e
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        let window = self.stream_receive_window(id);
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(window)) {
             Some(stream) => stream,
             None => {
                 trace!("received RESET_STREAM on closed stream");
@@ -492,6 +499,7 @@ impl StreamsState {
                 None => break,
             };
             pending.max_stream_data.remove(&id);
+            let window = self.stream_receive_window(id);
             let rs = match self
                 .recv
                 .get_mut(&id)
@@ -506,7 +514,7 @@ impl StreamsState {
             }
             retransmits.get_or_create().max_stream_data.insert(id);
 
-            let (max, _) = rs.max_stream_data(self.stream_receive_window);
+            let (max, _) = rs.max_stream_data(window);
             rs.record_sent_max_stream_data(max);
 
             trace!(stream = %id, max = max, "MAX_STREAM_DATA");
@@ -846,6 +854,31 @@ impl StreamsState {
         Ok(())
     }
 
+    /// Write a MAX_DATA frame with the connection-level limit last advertised to the peer
+    pub(in crate::connection) fn write_repeated_max_data(
+        &mut self,
+        buf: &mut Vec<u8>,
+        retransmits: &mut ThinRetransmits,
+        stats: &mut FrameStats,
+    ) {
+        let max = self.sent_max_data;
+        trace!(value = max.into_inner(), "MAX_DATA (repeated)");
+        retransmits.get_or_create().max_data = true;
+        buf.write(frame::FrameType::MAX_DATA);
+        buf.write(max);
+        stats.max_data += 1;
+    }
+
+    /// Whether a bidirectional stream is open: opened locally, or by the peer, and not yet freed
+    pub(crate) fn has_open_bidi_streams(&self) -> bool {
+        let next_remote = self.next_remote[Dir::Bi as usize];
+        self.send
+            .keys()
+            .chain(self.recv.keys())
+            .filter(|id| id.dir() == Dir::Bi)
+            .any(|id| id.initiator() == self.side || id.index() < next_remote)
+    }
+
     /// Whether a locally initiated stream has never been open
     pub(crate) fn is_local_unopened(&self, id: StreamId) -> bool {
         id.index() >= self.next[id.dir() as usize]
@@ -945,7 +978,8 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        self.free_recv.push(recv.free(self.stream_receive_window));
+        self.free_recv
+            .push(recv.free(self.stream_receive_window(id)));
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -974,7 +1008,11 @@ pub(super) fn get_or_insert_recv(
 ) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
     move |opt| {
         *opt = opt.take().map(|s| match s {
-            StreamRecv::Free(recv) => StreamRecv::Open(recv),
+            StreamRecv::Free(mut recv) => {
+                // The instance may have been used by a stream of another class before
+                recv.set_initial_max_data(initial_max_data);
+                StreamRecv::Open(recv)
+            }
             s => s,
         });
         opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data)))
@@ -999,7 +1037,7 @@ mod tests {
             128u32.into(),
             1024 * 1024,
             (1024 * 1024u32).into(),
-            (1024 * 1024u32).into(),
+            [(1024 * 1024u32).into(); 3],
         )
     }
 
@@ -1011,7 +1049,7 @@ mod tests {
             1u32.into(),
             1024 * 1024,
             (1024 * 1024u32).into(),
-            (1024 * 1024u32).into(),
+            [(1024 * 1024u32).into(); 3],
         );
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         let initial_max = client.local_max_data;

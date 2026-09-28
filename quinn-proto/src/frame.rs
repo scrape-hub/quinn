@@ -23,6 +23,11 @@ use arbitrary::Arbitrary;
 pub struct FrameType(u64);
 
 impl FrameType {
+    /// The frame type with the given value, which need not be one Quinn knows
+    pub(crate) fn from_varint(value: VarInt) -> Self {
+        Self(value.into_inner())
+    }
+
     fn stream(self) -> Option<StreamInfo> {
         if STREAM_TYS.contains(&self.0) {
             Some(StreamInfo(self.0 as u8))
@@ -130,6 +135,8 @@ frame_types! {
     CONNECTION_CLOSE = 0x1c,
     APPLICATION_CLOSE = 0x1d,
     HANDSHAKE_DONE = 0x1e,
+    // Reliable stream resets (draft-ietf-quic-reliable-stream-reset)
+    RESET_STREAM_AT = 0x24,
     // ACK Frequency
     ACK_FREQUENCY = 0xaf,
     IMMEDIATE_ACK = 0x1f,
@@ -582,6 +589,21 @@ impl Iter {
                 error_code: self.bytes.get()?,
                 final_offset: self.bytes.get()?,
             }),
+            FrameType::RESET_STREAM_AT => {
+                // Accepted because `reset_stream_at` may be advertised as an extra transport
+                // parameter, as Firefox does. Quinn does not keep the reliable part of the
+                // stream: the frame resets the stream like RESET_STREAM.
+                let frame = ResetStream {
+                    id: self.bytes.get()?,
+                    error_code: self.bytes.get()?,
+                    final_offset: self.bytes.get()?,
+                };
+                let reliable_size = self.bytes.get_var()?;
+                if reliable_size > frame.final_offset.into_inner() {
+                    return Err(IterErr::Malformed);
+                }
+                Frame::ResetStream(frame)
+            }
             FrameType::CONNECTION_CLOSE => Frame::Close(Close::Connection(ConnectionClose {
                 error_code: self.bytes.get()?,
                 frame_type: {
@@ -977,6 +999,32 @@ mod test {
             }
             ref x => panic!("incorrect frame {x:?}"),
         }
+    }
+
+    /// RESET_STREAM_AT resets the stream like RESET_STREAM; its reliable size may not exceed the
+    /// final size
+    #[test]
+    fn reset_stream_at_decoding() {
+        let encode = |reliable_size: u64| {
+            let mut buf = Vec::new();
+            buf.write(FrameType::RESET_STREAM_AT);
+            buf.write_var(4); // stream ID
+            buf.write_var(7); // error code
+            buf.write_var(100); // final size
+            buf.write_var(reliable_size);
+            Bytes::from(buf)
+        };
+        let frames = Iter::new(encode(50))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_matches!(
+            &frames[..],
+            [Frame::ResetStream(ResetStream { id, error_code, final_offset })]
+                if id.0 == 4 && error_code.0 == 7 && final_offset.0 == 100
+        );
+        let invalid = Iter::new(encode(101)).unwrap().next().unwrap();
+        assert!(invalid.is_err());
     }
 
     #[test]

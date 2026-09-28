@@ -25,6 +25,15 @@ use crate::{
     shared::ConnectionId,
 };
 
+mod fingerprint;
+pub use fingerprint::{
+    AckDecimation, AckPolicy, BufferedPacketProcessing, CryptoFraming, FingerprintConfig,
+    FirstPacketNumber, GreaseVersion, InitialPadding, MAX_AVAILABLE_VERSIONS,
+    MAX_EXTRA_TRANSPORT_PARAMETER_LEN, MAX_EXTRA_TRANSPORT_PARAMETERS, MAX_FIRST_PACKET_NUMBER,
+    PacketNumbering, PacketPadding, SpinBit, TransportParameterLayout, TransportParameterOrder,
+    VersionInformation,
+};
+pub(crate) use fingerprint::{MIN_ACK_DELAY_DRAFT07, VERSION_INFORMATION_ID};
 mod transport;
 #[cfg(feature = "qlog")]
 pub use transport::QlogConfig;

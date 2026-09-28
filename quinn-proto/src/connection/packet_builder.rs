@@ -1,10 +1,13 @@
+use std::mem;
+
 use bytes::Bytes;
 use rand::Rng;
 use tracing::{debug, trace, trace_span};
 
 use super::{Connection, SentFrames, spaces::SentPacket};
 use crate::{
-    ConnectionId, Instant, TransportError, TransportErrorCode,
+    ConnectionId, Instant, PacketNumbering, PacketPadding, SpinBit, TransportError,
+    TransportErrorCode,
     connection::ConnectionSide,
     frame::{self, Close},
     packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
@@ -24,6 +27,8 @@ pub(super) struct PacketBuilder {
     /// frames
     pub(super) max_size: usize,
     pub(super) tag_len: usize,
+    /// Whether padding goes in front of the frames instead of after them
+    leading_padding: bool,
     pub(super) _span: tracing::span::EnteredSpan,
 }
 
@@ -79,22 +84,38 @@ impl PacketBuilder {
         }
 
         let space = &mut conn.spaces[space_id];
-        let exact_number = match space_id {
-            SpaceId::Data => conn.packet_number_filter.allocate(&mut conn.rng, space),
-            _ => space.get_tx_number(),
+        let exact_number = if let Some(next) = conn.shared_pn.as_mut() {
+            // One counter for all spaces; the space still tracks its own sent packets
+            space.next_packet_number = *next;
+            *next += 1;
+            space.get_tx_number()
+        } else {
+            match space_id {
+                SpaceId::Data => conn.packet_number_filter.allocate(&mut conn.rng, space),
+                _ => space.get_tx_number(),
+            }
         };
 
         let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
 
-        let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
+        let number = match conn.config.fingerprint.packet_numbering {
+            PacketNumbering::Sequential { .. } => {
+                PacketNumber::new_sequential(exact_number, space.largest_acked_packet)
+            }
+            _ => PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0)),
+        };
+        let number = match mem::take(&mut conn.widen_next_pn) {
+            true => PacketNumber::covering(exact_number, 0, number.len().max(2)),
+            false => number,
+        };
         let header = match space_id {
             SpaceId::Data if space.crypto.is_some() => Header::Short {
                 dst_cid,
                 number,
-                spin: if conn.spin_enabled {
-                    conn.spin
-                } else {
-                    conn.rng.random()
+                spin: match conn.config.fingerprint.spin_bit {
+                    SpinBit::Standard if conn.spin_enabled => conn.spin,
+                    SpinBit::Standard | SpinBit::Random => conn.rng.random(),
+                    SpinBit::Zero => false,
                 },
                 key_phase: conn.key_phase,
             },
@@ -124,7 +145,10 @@ impl PacketBuilder {
             }),
         };
         let partial_encode = header.encode(buffer);
-        if conn.peer_params.grease_quic_bit && conn.rng.random() {
+        if conn.config.fingerprint.grease_fixed_bit
+            && conn.peer_params.grease_quic_bit
+            && conn.rng.random()
+        {
             buffer[partial_encode.start] ^= FIXED_BIT;
         }
 
@@ -148,10 +172,23 @@ impl PacketBuilder {
 
         // pn_len + payload_len + tag_len >= sample_size + 4
         // payload_len >= sample_size + 4 - pn_len - tag_len
-        let min_size = Ord::max(
-            buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len),
-            partial_encode.start + dst_cid.len() + 6,
-        );
+        let header_protection_size =
+            buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len);
+        let leading_padding = space_id != SpaceId::Initial
+            && conn.config.fingerprint.packet_padding == PacketPadding::Leading;
+        let min_size = match leading_padding {
+            // As RFC 9000, section 10.3 words it: at least 22 bytes more than the length of the
+            // connection IDs the peer puts into its packets
+            true => Ord::max(
+                header_protection_size,
+                (partial_encode.start + 22 + conn.local_cid_state.cid_len())
+                    .saturating_sub(tag_len),
+            ),
+            false => Ord::max(
+                header_protection_size,
+                partial_encode.start + dst_cid.len() + 6,
+            ),
+        };
         let max_size = buffer_capacity - tag_len;
         debug_assert!(max_size >= min_size);
 
@@ -165,6 +202,7 @@ impl PacketBuilder {
             max_size,
             tag_len,
             ack_eliciting,
+            leading_padding,
             _span: span,
         })
     }
@@ -238,8 +276,35 @@ impl PacketBuilder {
     ) -> (usize, bool) {
         let pad = buffer.len() < self.min_size;
         if pad {
-            trace!("PADDING * {}", self.min_size - buffer.len());
-            buffer.resize(self.min_size, 0);
+            let padding = self.min_size - buffer.len();
+            trace!("PADDING * {}", padding);
+            match self.leading_padding {
+                true => {
+                    // In front of the frames, as quiche places it
+                    let payload_start = self.partial_encode.start + self.partial_encode.header_len;
+                    let old_len = buffer.len();
+                    buffer.resize(old_len + padding, 0);
+                    buffer.copy_within(payload_start..old_len, payload_start + padding);
+                    buffer[payload_start..payload_start + padding].fill(0);
+                }
+                false => buffer.resize(self.min_size, 0),
+            }
+        }
+
+        #[cfg(test)]
+        if conn.logs_sent_packets() {
+            let payload_start = self.partial_encode.start + self.partial_encode.header_len;
+            let tag_len = self.tag_len;
+            let packet = super::SentPacketLog {
+                time: now,
+                space: self.space,
+                zero_rtt: self.space == SpaceId::Data
+                    && conn.spaces[SpaceId::Data].crypto.is_none(),
+                number: self.exact_number,
+                len: buffer.len() + tag_len - self.partial_encode.start,
+                payload: Bytes::copy_from_slice(&buffer[payload_start..]),
+            };
+            conn.log_sent_packet(packet);
         }
 
         let space = &conn.spaces[self.space];

@@ -21,15 +21,22 @@ pub(super) struct AckFrequencyState {
 }
 
 impl AckFrequencyState {
-    pub(super) fn new(default_max_ack_delay: Duration) -> Self {
+    /// `default_max_ack_delay` applies to the peer until its transport parameters are known,
+    /// `local_max_ack_delay` is the delay this endpoint advertises
+    pub(super) fn new(default_max_ack_delay: Duration, local_max_ack_delay: Duration) -> Self {
         Self {
             in_flight_ack_frequency_frame: None,
             next_outgoing_sequence_number: VarInt(0),
             peer_max_ack_delay: default_max_ack_delay,
 
             last_ack_frequency_frame: None,
-            max_ack_delay: default_max_ack_delay,
+            max_ack_delay: local_max_ack_delay,
         }
+    }
+
+    /// Whether the peer has taken control of our acknowledgement behavior with `ACK_FREQUENCY`
+    pub(super) fn controlled_by_peer(&self) -> bool {
+        self.last_ack_frequency_frame.is_some()
     }
 
     /// Returns the `max_ack_delay` that should be requested of the peer when sending an

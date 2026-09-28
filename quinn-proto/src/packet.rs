@@ -98,6 +98,17 @@ impl PartialDecode {
         }
     }
 
+    /// QUIC version of a long header packet other than Version Negotiation
+    pub(crate) fn version(&self) -> Option<u32> {
+        use ProtectedHeader::*;
+        match self.plain_header {
+            Initial(ProtectedInitialHeader { version, .. })
+            | Long { version, .. }
+            | Retry { version, .. } => Some(version),
+            Short { .. } | VersionNegotiate { .. } => None,
+        }
+    }
+
     /// The destination connection ID of the packet
     pub fn dst_cid(&self) -> &ConnectionId {
         self.plain_header.dst_cid()
@@ -292,7 +303,7 @@ impl Header {
                 number,
                 version,
             }) => {
-                w.write(u8::from(LongHeaderType::Initial) | number.tag());
+                w.write(LongHeaderType::Initial.to_byte(version) | number.tag());
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -313,7 +324,7 @@ impl Header {
                 number,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Standard(ty)) | number.tag());
+                w.write(LongHeaderType::Standard(ty).to_byte(version) | number.tag());
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -330,7 +341,7 @@ impl Header {
                 ref src_cid,
                 version,
             } => {
-                w.write(u8::from(LongHeaderType::Retry));
+                w.write(LongHeaderType::Retry.to_byte(version));
                 w.write(version);
                 dst_cid.encode_long(w);
                 src_cid.encode_long(w);
@@ -618,7 +629,7 @@ impl ProtectedHeader {
                 });
             }
 
-            match LongHeaderType::from_byte(first)? {
+            match LongHeaderType::from_byte(first, version) {
                 LongHeaderType::Initial => {
                     let token_len = buf.get_var()? as usize;
                     let token_start = buf.position() as usize;
@@ -688,12 +699,27 @@ pub(crate) enum PacketNumber {
 
 impl PacketNumber {
     pub(crate) fn new(n: u64, largest_acked: u64) -> Self {
-        let range = (n - largest_acked) * 2;
-        if range < 1 << 8 {
+        Self::covering(n, (n - largest_acked) * 2, 1)
+    }
+
+    /// Encoding as chosen by neqo: covering twice the distance to the largest acknowledged
+    /// packet, or `n + 1` while nothing has been acknowledged
+    pub(crate) fn new_sequential(n: u64, largest_acked: Option<u64>) -> Self {
+        let range = match largest_acked {
+            Some(largest_acked) => (n - largest_acked) * 2,
+            None => n + 1,
+        };
+        Self::covering(n, range, 1)
+    }
+
+    /// The shortest encoding of `n` of at least `min_len` bytes that can express `range`
+    /// distinct values
+    pub(crate) fn covering(n: u64, range: u64, min_len: usize) -> Self {
+        if range < 1 << 8 && min_len <= 1 {
             Self::U8(n as u8)
-        } else if range < 1 << 16 {
+        } else if range < 1 << 16 && min_len <= 2 {
             Self::U16(n as u16)
-        } else if range < 1 << 24 {
+        } else if range < 1 << 24 && min_len <= 3 {
             Self::U24(n as u32)
         } else if range < 1 << 32 {
             Self::U32(n as u32)
@@ -815,28 +841,35 @@ pub(crate) enum LongHeaderType {
 }
 
 impl LongHeaderType {
-    fn from_byte(b: u8) -> Result<Self, PacketDecodeError> {
+    fn from_byte(b: u8, version: u32) -> Self {
         use {LongHeaderType::*, LongType::*};
         debug_assert!(b & LONG_HEADER_FORM != 0, "not a long packet");
-        Ok(match (b & 0x30) >> 4 {
+        // QUIC version 2 rotates the type codes by one (RFC 9369, section 3.2)
+        let bits = match version {
+            crate::QUIC_VERSION_2 => ((b & 0x30) >> 4).wrapping_sub(1) & 0x3,
+            _ => (b & 0x30) >> 4,
+        };
+        match bits {
             0x0 => Initial,
             0x1 => Standard(ZeroRtt),
             0x2 => Standard(Handshake),
-            0x3 => Retry,
-            _ => unreachable!(),
-        })
-    }
-}
-
-impl From<LongHeaderType> for u8 {
-    fn from(ty: LongHeaderType) -> Self {
-        use {LongHeaderType::*, LongType::*};
-        match ty {
-            Initial => LONG_HEADER_FORM | FIXED_BIT,
-            Standard(ZeroRtt) => LONG_HEADER_FORM | FIXED_BIT | (0x1 << 4),
-            Standard(Handshake) => LONG_HEADER_FORM | FIXED_BIT | (0x2 << 4),
-            Retry => LONG_HEADER_FORM | FIXED_BIT | (0x3 << 4),
+            _ => Retry,
         }
+    }
+
+    fn to_byte(self, version: u32) -> u8 {
+        use {LongHeaderType::*, LongType::*};
+        let bits: u8 = match self {
+            Initial => 0x0,
+            Standard(ZeroRtt) => 0x1,
+            Standard(Handshake) => 0x2,
+            Retry => 0x3,
+        };
+        let bits = match version {
+            crate::QUIC_VERSION_2 => (bits + 1) & 0x3,
+            _ => bits,
+        };
+        LONG_HEADER_FORM | FIXED_BIT | (bits << 4)
     }
 }
 
@@ -1009,6 +1042,104 @@ mod tests {
             _ => {
                 panic!("unexpected header {:?}", packet.header);
             }
+        }
+    }
+
+    /// The server Initial of RFC 9369, appendix A.3
+    #[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+    #[test]
+    fn header_encoding_v2() {
+        use crate::Side;
+        use crate::crypto::rustls::{initial_keys, initial_suite_from_provider};
+        #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
+        use rustls::crypto::aws_lc_rs::default_provider;
+        #[cfg(feature = "rustls-ring")]
+        use rustls::crypto::ring::default_provider;
+        use rustls::quic::Version;
+
+        let dcid = ConnectionId::new(&hex!("8394c8f03e515708"));
+        let suite = initial_suite_from_provider(&std::sync::Arc::new(default_provider())).unwrap();
+        let server = initial_keys(Version::V2, dcid, Side::Server, &suite);
+        let payload = hex!(
+            "02000000000600405a020000560303ee fce7f7b37ba1d1632e96677825ddf739
+             88cfc79825df566dc5430b9a045a1200 130100002e00330024001d00209d3c94
+             0d89690b84d08a60993c144eca684d10 81287c834d5311bcf32bb9da1a002b00
+             020304"
+        );
+        let mut buf = Vec::new();
+        let header = Header::Initial(InitialHeader {
+            number: PacketNumber::U16(1),
+            src_cid: ConnectionId::new(&hex!("f067a5502a4262b5")),
+            dst_cid: ConnectionId::new(&[]),
+            token: Bytes::new(),
+            version: crate::QUIC_VERSION_2,
+        });
+        let encode = header.encode(&mut buf);
+        buf.extend_from_slice(&payload);
+        buf.resize(buf.len() + server.packet.local.tag_len(), 0);
+        encode.finish(
+            &mut buf,
+            &*server.header.local,
+            Some((1, &*server.packet.local)),
+        );
+        assert_eq!(
+            buf[..],
+            hex!(
+                "dc6b3343cf0008f067a5502a4262b500 4075d92faaf16f05d8a4398c47089698
+                 baeea26b91eb761d9b89237bbf872630 17915358230035f7fd3945d88965cf17
+                 f9af6e16886c61bfc703106fbaf3cb4c fa52382dd16a393e42757507698075b2
+                 c984c707f0a0812d8cd5a6881eaf21ce da98f4bd23f6fe1a3e2c43edd9ce7ca8
+                 4bed8521e2e140"
+            )[..]
+        );
+
+        let client = initial_keys(Version::V2, dcid, Side::Client, &suite);
+        let decode = PartialDecode::new(
+            buf.as_slice().into(),
+            &FixedLengthConnectionIdParser::new(0),
+            &[crate::QUIC_VERSION_2],
+            false,
+        )
+        .unwrap()
+        .0;
+        let mut packet = decode.finish(Some(&*client.header.remote)).unwrap();
+        assert_eq!(
+            packet.header_data[..],
+            hex!("d16b3343cf0008f067a5502a4262b50040750001")[..]
+        );
+        client
+            .packet
+            .remote
+            .decrypt(1, &packet.header_data, &mut packet.payload)
+            .unwrap();
+        assert_eq!(packet.payload[..], payload[..]);
+        assert!(matches!(
+            packet.header,
+            Header::Initial(InitialHeader {
+                number: PacketNumber::U16(1),
+                ..
+            })
+        ));
+    }
+
+    /// The type codes of long headers depend on the version (RFC 9369, section 3.2)
+    #[test]
+    fn long_header_types() {
+        use LongHeaderType::*;
+        use LongType::*;
+        for (ty, v1, v2) in [
+            (Initial, 0xc0, 0xd0),
+            (Standard(ZeroRtt), 0xd0, 0xe0),
+            (Standard(Handshake), 0xe0, 0xf0),
+            (Retry, 0xf0, 0xc0),
+        ] {
+            assert_eq!(ty.to_byte(1), v1);
+            assert_eq!(ty.to_byte(crate::QUIC_VERSION_2), v2);
+            assert_eq!(LongHeaderType::from_byte(v1 | 0x0f, 1), ty);
+            assert_eq!(
+                LongHeaderType::from_byte(v2 | 0x0f, crate::QUIC_VERSION_2),
+                ty
+            );
         }
     }
 }

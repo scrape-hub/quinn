@@ -5,6 +5,7 @@ use std::{io, sync::Mutex, time::Instant};
 #[cfg(feature = "qlog")]
 use qlog::streamer::QlogStreamer;
 
+use super::fingerprint::{FingerprintConfig, TransportParameterLayout};
 #[cfg(feature = "qlog")]
 use crate::QlogStream;
 use crate::{
@@ -29,9 +30,15 @@ pub struct TransportConfig {
     pub(crate) max_concurrent_uni_streams: VarInt,
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
+    pub(crate) stream_receive_window_bidi_local: Option<VarInt>,
+    pub(crate) stream_receive_window_bidi_remote: Option<VarInt>,
+    pub(crate) stream_receive_window_uni: Option<VarInt>,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
+    pub(crate) max_ack_delay: Duration,
+    pub(crate) active_connection_id_limit: Option<u32>,
+    pub(crate) max_datagram_frame_size: Option<VarInt>,
 
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
@@ -44,6 +51,7 @@ pub struct TransportConfig {
 
     pub(crate) persistent_congestion_threshold: u32,
     pub(crate) keep_alive_interval: Option<Duration>,
+    pub(crate) keep_alive_only_with_open_bidi_streams: bool,
     pub(crate) crypto_buffer_size: usize,
     pub(crate) allow_spin: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
@@ -54,6 +62,9 @@ pub struct TransportConfig {
     pub(crate) congestion_controller_factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
 
     pub(crate) enable_segmentation_offload: bool,
+
+    pub(crate) transport_parameter_layout: TransportParameterLayout,
+    pub(crate) fingerprint: FingerprintConfig,
 
     pub(crate) qlog_sink: QlogSink,
 }
@@ -113,6 +124,91 @@ impl TransportConfig {
     /// streams.
     pub fn stream_receive_window(&mut self, value: VarInt) -> &mut Self {
         self.stream_receive_window = value;
+        self
+    }
+
+    /// Per-stream receive window for bidirectional streams opened by this endpoint
+    ///
+    /// Overrides [`stream_receive_window`](Self::stream_receive_window) for this class of
+    /// streams. Advertised as the `initial_max_stream_data_bidi_local` transport parameter and
+    /// used as the flow control window of every such stream. `None` (the default) falls back to
+    /// `stream_receive_window`.
+    pub fn stream_receive_window_bidi_local(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_receive_window_bidi_local = value;
+        self
+    }
+
+    /// Per-stream receive window for bidirectional streams opened by the peer
+    ///
+    /// Overrides [`stream_receive_window`](Self::stream_receive_window) for this class of
+    /// streams. Advertised as the `initial_max_stream_data_bidi_remote` transport parameter.
+    /// `None` (the default) falls back to `stream_receive_window`.
+    pub fn stream_receive_window_bidi_remote(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_receive_window_bidi_remote = value;
+        self
+    }
+
+    /// Per-stream receive window for unidirectional streams opened by the peer
+    ///
+    /// Overrides [`stream_receive_window`](Self::stream_receive_window) for this class of
+    /// streams. Advertised as the `initial_max_stream_data_uni` transport parameter. `None` (the
+    /// default) falls back to `stream_receive_window`.
+    pub fn stream_receive_window_uni(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.stream_receive_window_uni = value;
+        self
+    }
+
+    pub(crate) fn stream_receive_windows(&self) -> StreamReceiveWindows {
+        let fallback = self.stream_receive_window;
+        StreamReceiveWindows {
+            bidi_local: self.stream_receive_window_bidi_local.unwrap_or(fallback),
+            bidi_remote: self.stream_receive_window_bidi_remote.unwrap_or(fallback),
+            uni: self.stream_receive_window_uni.unwrap_or(fallback),
+        }
+    }
+
+    /// Maximum time this endpoint delays acknowledging ack-eliciting packets
+    ///
+    /// Used as the delay of the local delayed-ACK timer and advertised to the peer as the
+    /// `max_ack_delay` transport parameter, rounded up to whole milliseconds; the parameter is
+    /// omitted when it equals the protocol default of 25ms. Must be below 2^14 milliseconds;
+    /// larger values are clamped. Defaults to 25ms.
+    pub fn max_ack_delay(&mut self, value: Duration) -> &mut Self {
+        self.max_ack_delay = value.min(Duration::from_millis((1 << 14) - 1));
+        self
+    }
+
+    /// Number of connection IDs issued by the peer that this endpoint is willing to store
+    ///
+    /// The endpoint stores up to this many connection IDs of the peer and advertises the number
+    /// as the `active_connection_id_limit` transport parameter. The parameter is never sent when
+    /// the local connection ID length is zero, since the peer then has no reason to issue
+    /// connection IDs (see [`EndpointConfig::cid_generator`]). Values are clamped to `2..=64`; a
+    /// value of 2 equals the protocol default and is therefore not transmitted. `None` (the
+    /// default) uses 5.
+    ///
+    /// [`EndpointConfig::cid_generator`]: crate::EndpointConfig::cid_generator
+    pub fn active_connection_id_limit(&mut self, value: Option<u32>) -> &mut Self {
+        self.active_connection_id_limit = value.map(|x| x.clamp(2, MAX_ACTIVE_CID_LIMIT));
+        self
+    }
+
+    /// Number of remote connection IDs to store, i.e. the `active_connection_id_limit` we send
+    /// when our connection IDs are not empty
+    pub(crate) fn remote_cid_limit(&self) -> u32 {
+        self.active_connection_id_limit
+            .unwrap_or(crate::cid_queue::CidQueue::LEN as u32)
+    }
+
+    /// Largest DATAGRAM frame this endpoint accepts, as advertised to the peer
+    ///
+    /// Only takes effect while datagrams are enabled, i.e. while
+    /// [`datagram_receive_buffer_size`](Self::datagram_receive_buffer_size) is `Some`. `None`
+    /// (the default) advertises the receive buffer size, capped at 65535. An explicit value is
+    /// capped at the receive buffer size, so that every datagram the peer is allowed to send can
+    /// be buffered.
+    pub fn max_datagram_frame_size(&mut self, value: Option<VarInt>) -> &mut Self {
+        self.max_datagram_frame_size = value;
         self
     }
 
@@ -261,6 +357,20 @@ impl TransportConfig {
         self
     }
 
+    /// Whether keep-alive packets are only sent while at least one bidirectional stream is open
+    ///
+    /// Browsers keep a connection alive only while requests are outstanding and otherwise let it
+    /// time out silently: quiche pings while the HTTP/3 session has active request streams, neqo
+    /// only for streams marked as keep-alive. HTTP/3 requests are bidirectional streams, while its
+    /// control and QPACK streams are unidirectional and stay open for the whole connection, so
+    /// only bidirectional streams count. A stream counts from the moment it is opened until both
+    /// of its halves are finished and freed. Has no effect without
+    /// [`keep_alive_interval`](Self::keep_alive_interval). Disabled by default.
+    pub fn keep_alive_only_with_open_bidi_streams(&mut self, value: bool) -> &mut Self {
+        self.keep_alive_only_with_open_bidi_streams = value;
+        self
+    }
+
     /// Maximum quantity of out-of-order crypto layer data to buffer
     pub fn crypto_buffer_size(&mut self, value: usize) -> &mut Self {
         self.crypto_buffer_size = value;
@@ -342,6 +452,22 @@ impl TransportConfig {
         self
     }
 
+    /// Which optional transport parameters to send, and in which order
+    ///
+    /// See [`TransportParameterLayout`]. The default reproduces upstream Quinn.
+    pub fn transport_parameter_layout(&mut self, value: TransportParameterLayout) -> &mut Self {
+        self.transport_parameter_layout = value;
+        self
+    }
+
+    /// Wire behaviour that is not negotiated but visible to the peer or to on-path observers
+    ///
+    /// See [`FingerprintConfig`]. The default reproduces upstream Quinn.
+    pub fn fingerprint(&mut self, value: FingerprintConfig) -> &mut Self {
+        self.fingerprint = value;
+        self
+    }
+
     /// qlog capture configuration to use for a particular connection
     #[cfg(feature = "qlog")]
     pub fn qlog_stream(&mut self, stream: Option<QlogStream>) -> &mut Self {
@@ -364,9 +490,15 @@ impl Default for TransportConfig {
             // 30 second default recommended by RFC 9308 § 3.2
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
+            stream_receive_window_bidi_local: None,
+            stream_receive_window_bidi_remote: None,
+            stream_receive_window_uni: None,
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
+            max_ack_delay: Duration::from_millis(25),
+            active_connection_id_limit: None,
+            max_datagram_frame_size: None,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -379,6 +511,7 @@ impl Default for TransportConfig {
 
             persistent_congestion_threshold: 3,
             keep_alive_interval: None,
+            keep_alive_only_with_open_bidi_streams: false,
             crypto_buffer_size: 16 * 1024,
             allow_spin: true,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
@@ -389,6 +522,9 @@ impl Default for TransportConfig {
             congestion_controller_factory: Arc::new(congestion::CubicConfig::default()),
 
             enable_segmentation_offload: true,
+
+            transport_parameter_layout: TransportParameterLayout::default(),
+            fingerprint: FingerprintConfig::default(),
 
             qlog_sink: QlogSink::default(),
         }
@@ -402,9 +538,15 @@ impl fmt::Debug for TransportConfig {
             max_concurrent_uni_streams,
             max_idle_timeout,
             stream_receive_window,
+            stream_receive_window_bidi_local,
+            stream_receive_window_bidi_remote,
+            stream_receive_window_uni,
             receive_window,
             send_window,
             send_fairness,
+            max_ack_delay,
+            active_connection_id_limit,
+            max_datagram_frame_size,
             packet_threshold,
             time_threshold,
             initial_rtt,
@@ -415,6 +557,7 @@ impl fmt::Debug for TransportConfig {
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
+            keep_alive_only_with_open_bidi_streams,
             crypto_buffer_size,
             allow_spin,
             datagram_receive_buffer_size,
@@ -423,6 +566,8 @@ impl fmt::Debug for TransportConfig {
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
             enable_segmentation_offload,
+            transport_parameter_layout,
+            fingerprint,
             qlog_sink,
         } = self;
         let mut s = fmt.debug_struct("TransportConfig");
@@ -431,9 +576,21 @@ impl fmt::Debug for TransportConfig {
             .field("max_concurrent_uni_streams", max_concurrent_uni_streams)
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
+            .field(
+                "stream_receive_window_bidi_local",
+                stream_receive_window_bidi_local,
+            )
+            .field(
+                "stream_receive_window_bidi_remote",
+                stream_receive_window_bidi_remote,
+            )
+            .field("stream_receive_window_uni", stream_receive_window_uni)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
+            .field("max_ack_delay", max_ack_delay)
+            .field("active_connection_id_limit", active_connection_id_limit)
+            .field("max_datagram_frame_size", max_datagram_frame_size)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)
             .field("initial_rtt", initial_rtt)
@@ -447,18 +604,38 @@ impl fmt::Debug for TransportConfig {
                 persistent_congestion_threshold,
             )
             .field("keep_alive_interval", keep_alive_interval)
+            .field(
+                "keep_alive_only_with_open_bidi_streams",
+                keep_alive_only_with_open_bidi_streams,
+            )
             .field("crypto_buffer_size", crypto_buffer_size)
             .field("allow_spin", allow_spin)
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             // congestion_controller_factory not debug
-            .field("enable_segmentation_offload", enable_segmentation_offload);
+            .field("enable_segmentation_offload", enable_segmentation_offload)
+            .field("transport_parameter_layout", transport_parameter_layout)
+            .field("fingerprint", fingerprint);
         if cfg!(feature = "qlog") {
             s.field("qlog_stream", &qlog_sink.is_enabled());
         }
 
         s.finish_non_exhaustive()
     }
+}
+
+/// Largest accepted value for [`TransportConfig::active_connection_id_limit`]
+pub(crate) const MAX_ACTIVE_CID_LIMIT: u32 = 64;
+
+/// Per-stream receive windows of the three stream classes, from the local point of view
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct StreamReceiveWindows {
+    /// Bidirectional streams opened locally
+    pub(crate) bidi_local: VarInt,
+    /// Bidirectional streams opened by the peer
+    pub(crate) bidi_remote: VarInt,
+    /// Unidirectional streams opened by the peer
+    pub(crate) uni: VarInt,
 }
 
 /// Parameters for controlling the peer's acknowledgement frequency

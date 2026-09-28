@@ -35,7 +35,10 @@ use crate::{
 mod util;
 use util::*;
 
+mod async_handshake;
+mod fingerprint;
 mod token;
+mod version;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;

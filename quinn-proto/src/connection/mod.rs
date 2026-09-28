@@ -4,7 +4,8 @@ use std::{
     convert::TryFrom,
     fmt, io, mem,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, OnceLock},
+    task::{Poll, Wake, Waker},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -21,7 +22,10 @@ use crate::{
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
-    config::{ServerConfig, TransportConfig},
+    config::{
+        AckPolicy, BufferedPacketProcessing, InitialPadding, PacketNumbering, ServerConfig,
+        TransportConfig,
+    },
     crypto::{self, KeyPair, Keys, PacketKey},
     frame::{self, Close, Datagram, FrameStruct, NewConnectionId, NewToken},
     packet::{
@@ -42,6 +46,16 @@ use ack_frequency::AckFrequencyState;
 
 mod assembler;
 pub use assembler::Chunk;
+
+mod async_handshake;
+use async_handshake::{MAX_UNDECRYPTABLE_DEFERRAL, MAX_UNDECRYPTABLE_PACKETS};
+mod crypto_framing;
+mod fingerprint;
+mod version_negotiation;
+#[cfg(test)]
+pub(crate) use fingerprint::SentPacketLog;
+use version_negotiation::VersionNegotiation;
+pub(crate) use version_negotiation::negotiate_version;
 
 mod cid_state;
 use cid_state::CidState;
@@ -72,7 +86,9 @@ mod spaces;
 pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
 use spaces::Retransmits;
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
+use spaces::{
+    PacketNumberFilter, PacketSpace, QueuedAck, SendableFrames, SentPacket, ThinRetransmits,
+};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
@@ -197,6 +213,40 @@ pub struct Connection {
     error: Option<ConnectionError>,
     /// Identifies Data-space packet numbers to skip. Not used in earlier spaces.
     packet_number_filter: PacketNumberFilter,
+    /// Next packet number when all packet number spaces share one counter
+    shared_pn: Option<u64>,
+    /// Whether the next packet gets a packet number of at least two bytes
+    ///
+    /// Reproduces quiche, whose packet number length estimate is inflated right after the first
+    /// packet of a ClientHello split by chaos protection.
+    widen_next_pn: bool,
+    /// Whether the datagram under construction must end after the current packet
+    end_datagram: bool,
+    /// Whether the transmit under construction must end after the current packet
+    end_transmit: bool,
+    /// Whether the client holds back its Finished for the first application data, see
+    /// `FingerprintConfig::finished_with_first_data`
+    finished_held: bool,
+    /// Number of connection IDs requested before the handshake completed
+    early_cids: u64,
+    /// Number of packets sent in a row that carried no ack-eliciting frame
+    non_ack_eliciting_run: u64,
+    /// Whether the next 1-RTT packet repeats the last MAX_DATA frame sent
+    repeat_max_data: bool,
+    /// Whether 1-RTT packets kept during the handshake wait until 1-RTT data has been sent
+    defer_undecryptable: bool,
+    /// Waker passed to the crypto session while the handshake waits for asynchronous work
+    handshake_waker: Option<Waker>,
+    /// Whether the crypto session waits for asynchronous work
+    handshake_pending: bool,
+    /// Whether `Event::HandshakeDataReady` has been emitted
+    handshake_data_ready: bool,
+    /// 1-RTT packets that arrived while the handshake waited for asynchronous work and could not
+    /// be decrypted yet, with their time of arrival
+    undecryptable: VecDeque<(Instant, SocketAddr, Option<EcnCodepoint>, PartialDecode)>,
+    /// Every packet sent, before encryption, if enabled
+    #[cfg(test)]
+    sent_log: Option<Vec<SentPacketLog>>,
 
     //
     // Queued non-retransmittable 1-RTT data
@@ -238,6 +288,8 @@ pub struct Connection {
     stats: ConnectionStats,
     /// QUIC version used for the connection.
     version: u32,
+    /// Compatible version negotiation
+    version_negotiation: VersionNegotiation,
 }
 
 impl Connection {
@@ -256,21 +308,39 @@ impl Connection {
         allow_mtud: bool,
         rng_seed: [u8; 32],
         side_args: SideArgs,
+        initial_keys: Option<Keys>,
     ) -> Self {
         let pref_addr_cid = side_args.pref_addr_cid();
         let path_validated = side_args.path_validated();
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
-        let initial_space = PacketSpace {
-            crypto: Some(crypto.initial_keys(&init_cid, side)),
-            ..PacketSpace::new(now)
-        };
         let state = State::Handshake(state::Handshake {
             rem_cid_set: side.is_server(),
             expected_token: Bytes::new(),
             client_hello: None,
         });
         let mut rng = StdRng::from_seed(rng_seed);
+        let (first_initial_pn, shared_pn) = match &config.fingerprint.packet_numbering {
+            PacketNumbering::Standard => (0, None),
+            PacketNumbering::Sequential { first_initial } => (first_initial.draw(&mut rng), None),
+            // Already bounded by `FingerprintConfig::packet_numbering`.
+            PacketNumbering::Shared { first } => (*first, Some(*first)),
+        };
+        // RFC 9001 section 5.2 derives Initial keys from the destination CID alone, so a caller
+        // that already derived them for this version and CID (compatible version negotiation,
+        // RFC 9368) hands them over instead of the session deriving them again.
+        let initial_keys = initial_keys.unwrap_or_else(|| crypto.initial_keys(&init_cid, side));
+        let initial_space = PacketSpace {
+            crypto: Some(initial_keys),
+            next_packet_number: first_initial_pn,
+            ..PacketSpace::new(now)
+        };
+        let skip_packet_numbers = matches!(
+            config.fingerprint.packet_numbering,
+            PacketNumbering::Standard
+        );
+        #[cfg(test)]
+        let skip_packet_numbers = skip_packet_numbers && !config.deterministic_packet_numbers;
         let mut this = Self {
             endpoint_config,
             crypto,
@@ -298,7 +368,14 @@ impl Connection {
             // simultaneous key update by both is just like a regular key update with a really fast
             // response. Inspired by quic-go's similar behavior of performing the first key update
             // at the 100th short-header packet.
-            key_phase_size: rng.random_range(10..1000),
+            key_phase_size: {
+                let size = rng.random_range(10..1000);
+                match config.fingerprint.early_key_update {
+                    true => size,
+                    // Set from the confidentiality limit once 1-RTT keys are available
+                    false => u64::MAX,
+                }
+            },
             peer_params: TransportParameters::default(),
             orig_rem_cid: rem_cid,
             initial_dst_cid: init_cid,
@@ -320,20 +397,33 @@ impl Connection {
             timers: TimerTable::default(),
             authentication_failures: 0,
             error: None,
-            #[cfg(test)]
-            packet_number_filter: match config.deterministic_packet_numbers {
-                false => PacketNumberFilter::new(&mut rng),
-                true => PacketNumberFilter::disabled(),
+            packet_number_filter: match skip_packet_numbers {
+                true => PacketNumberFilter::new(&mut rng),
+                false => PacketNumberFilter::disabled(),
             },
-            #[cfg(not(test))]
-            packet_number_filter: PacketNumberFilter::new(&mut rng),
+            shared_pn,
+            widen_next_pn: false,
+            end_datagram: false,
+            end_transmit: false,
+            finished_held: false,
+            early_cids: 0,
+            non_ack_eliciting_run: 0,
+            repeat_max_data: false,
+            defer_undecryptable: false,
+            handshake_waker: None,
+            handshake_pending: false,
+            handshake_data_ready: false,
+            undecryptable: VecDeque::new(),
+            #[cfg(test)]
+            sent_log: None,
 
             path_responses: PathResponses::default(),
             close: false,
 
-            ack_frequency: AckFrequencyState::new(get_max_ack_delay(
-                &TransportParameters::default(),
-            )),
+            ack_frequency: AckFrequencyState::new(
+                get_max_ack_delay(&TransportParameters::default()),
+                config.max_ack_delay,
+            ),
 
             pto_count: 0,
 
@@ -347,14 +437,18 @@ impl Connection {
                 config.max_concurrent_bidi_streams,
                 config.send_window,
                 config.receive_window,
-                config.stream_receive_window,
+                {
+                    let windows = config.stream_receive_windows();
+                    [windows.bidi_local, windows.bidi_remote, windows.uni]
+                },
             ),
             datagrams: DatagramState::default(),
+            rem_cids: CidQueue::with_capacity(rem_cid, config.remote_cid_limit() as usize),
             config,
-            rem_cids: CidQueue::new(rem_cid),
             rng,
             stats: ConnectionStats::default(),
             version,
+            version_negotiation: VersionNegotiation::new(version),
         };
         if path_validated {
             this.on_path_validated();
@@ -363,6 +457,12 @@ impl Connection {
             // Kick off the connection
             this.write_crypto();
             this.init_0rtt();
+            if this.config.fingerprint.early_connection_ids && this.local_cid_state.cid_len() > 0 {
+                // Every peer accepts at least two active connection IDs, the one used during the
+                // handshake included. The endpoint hands it over right away, see
+                // `early_cids_wanted`.
+                this.early_cids = 1;
+            }
         }
         this
     }
@@ -465,7 +565,21 @@ impl Connection {
         // Position in `buf` of the first byte of the current UDP datagram. When coalescing QUIC
         // packets, this can be earlier than the start of the current QUIC packet.
         let mut datagram_start = 0;
-        let mut segment_size = usize::from(self.path.current_mtu());
+        // Fixed size of datagrams carrying Initial packets, which also caps every datagram while
+        // Initial packets may be sent
+        let initial_size =
+            match self.side.is_client() && self.spaces[SpaceId::Initial].crypto.is_some() {
+                true => self
+                    .config
+                    .fingerprint
+                    .effective_initial_padding()
+                    .fixed_size(),
+                false => None,
+            };
+        let mut segment_size = match initial_size {
+            Some(size) => usize::from(size),
+            None => usize::from(self.path.current_mtu()),
+        };
 
         if let Some(challenge) = self.send_path_challenge(now, buf) {
             return Some(challenge);
@@ -496,6 +610,13 @@ impl Connection {
             _ => false,
         };
 
+        if self.finished_held {
+            match close || self.finished_hold_over(now) {
+                true => self.release_finished(),
+                false => return None,
+            }
+        }
+
         // Check whether we need to send an ACK_FREQUENCY frame
         if let Some(config) = &self.config.ack_frequency_config {
             self.spaces[SpaceId::Data].pending.ack_frequency = self
@@ -514,8 +635,19 @@ impl Connection {
         let mut builder_storage: Option<PacketBuilder> = None;
         let mut sent_frames = None;
         let mut pad_datagram = false;
+        // Whether the current datagram carries an Initial packet and has a fixed size
+        let mut fixed_size_initial = false;
         let mut pad_datagram_to_mtu = false;
         let mut congestion_blocked = false;
+        // Acknowledgements that became due after different received datagrams
+        // (`ack_each_datagram`) do not share a datagram: an endpoint that sends after every
+        // received datagram, as browsers do, would have sent them apart. `u64::MAX` stands for
+        // what is ready now; `None` for a transmission without packets yet.
+        let mut datagram_group = None;
+        // An Initial packet that waits for the rest of its datagram, see `hold_initial`
+        let mut held_initial = None;
+        // Whether the Initial keys are to be discarded once a held Initial packet is finished
+        let mut discard_initial = false;
 
         // Iterate over all spaces and find data to send
         let mut space_idx = 0;
@@ -530,7 +662,7 @@ impl Connection {
             // handle large fixed-size frames, which only exist in 1-RTT (application datagrams). We
             // don't account for coalesced packets potentially occupying space because frames can
             // always spill into the next datagram.
-            let pn = self.packet_number_filter.peek(&self.spaces[SpaceId::Data]);
+            let pn = self.peek_data_pn();
             let frame_space_1rtt =
                 segment_size.saturating_sub(self.predict_1rtt_overhead(Some(pn)));
 
@@ -546,6 +678,16 @@ impl Connection {
                 || self.spaces[space_id].immediate_ack_pending;
             if space_id == SpaceId::Data {
                 ack_eliciting |= self.can_send_1rtt(frame_space_1rtt);
+            }
+            // An acknowledgement kept from an earlier datagram travels alone, unless other frames
+            // were ready then
+            let queued_ack_only = self.spaces[space_id].pending_acks.next_queued_is_ack_only();
+            ack_eliciting &= !queued_ack_only;
+            if !ack_eliciting && !close && self.needs_ack_eliciting_frame(space_id, can_send) {
+                // quiche's `OnAckNeedsRetransmittableFrame`: make the peer acknowledge
+                trace!("adding MAX_DATA to an ACK-only packet");
+                self.repeat_max_data = true;
+                ack_eliciting = true;
             }
 
             pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu;
@@ -568,7 +710,16 @@ impl Connection {
             } else {
                 unreachable!("tried to send {:?} packet without keys", space_id)
             };
-            if !coalesce || buf_capacity - buf_end < MIN_PACKET_SPACE + tag_len {
+            let group = self.spaces[space_id]
+                .pending_acks
+                .next_queued_generation()
+                .unwrap_or(u64::MAX);
+            // Other frames that are ready now may have been ready then; a mere acknowledgement
+            // that is due now was not
+            let same_group = datagram_group.map_or(true, |current| {
+                current == group || (group == u64::MAX && ack_eliciting)
+            });
+            if !coalesce || !same_group || buf_capacity - buf_end < MIN_PACKET_SPACE + tag_len {
                 // We need to send 1 more datagram and extend the buffer for that.
 
                 // Is 1 more datagram allowed?
@@ -632,11 +783,15 @@ impl Connection {
 
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
-                    if pad_datagram {
+                    let append_zeros = fixed_size_initial
+                        && held_initial.is_none()
+                        && self.pad_initial(&mut builder);
+                    if pad_datagram && !fixed_size_initial {
                         builder.pad_to(MIN_INITIAL_SIZE);
                     }
 
-                    if num_datagrams > 1 || pad_datagram_to_mtu {
+                    // A datagram with a fixed-size Initial always fills the segment
+                    if (num_datagrams > 1 || pad_datagram_to_mtu) && !fixed_size_initial {
                         // If too many padding bytes would be required to continue the GSO batch
                         // after this packet, end the GSO batch here. Ensures that fixed-size frames
                         // with heterogeneous sizes (e.g. application datagrams) won't inadvertently
@@ -671,6 +826,16 @@ impl Connection {
                     }
 
                     builder.finish_and_track(now, self, sent_frames.take(), buf);
+                    buf_capacity += self.conclude_held_initial(
+                        now,
+                        &mut held_initial,
+                        &mut discard_initial,
+                        buf,
+                        initial_size,
+                    );
+                    if append_zeros {
+                        Self::append_zeros(buf, datagram_start, initial_size);
+                    }
 
                     if num_datagrams == 1 {
                         // Set the segment size for this GSO batch to the size of the first UDP
@@ -683,6 +848,16 @@ impl Connection {
                         // Clip the unused capacity out of the buffer so future packets don't
                         // overrun
                         buf_capacity = buf.len();
+
+                        // A small first datagram, e.g. one that only acknowledges and was not
+                        // coalesced, leaves no room for further datagrams in this batch. Only
+                        // fingerprint options produce such datagrams followed by more packets.
+                        if (!self.config.fingerprint.coalesce_packets
+                            || self.config.fingerprint.ack_each_datagram)
+                            && segment_size < MIN_PACKET_SPACE + tag_len
+                        {
+                            break;
+                        }
 
                         // Check whether the data we planned to send will fit in the reduced segment
                         // size. If not, bail out and leave it for the next GSO batch so we don't
@@ -707,8 +882,11 @@ impl Connection {
                         self.spaces[space_id].loss_probes -= 1;
                         // Clamp the datagram to at most the minimum MTU to ensure that loss probes
                         // can get through and enable recovery even if the path MTU has shrank
-                        // unexpectedly.
-                        std::cmp::min(segment_size, usize::from(INITIAL_MTU))
+                        // unexpectedly. A fixed Initial size is the path MTU during the handshake.
+                        std::cmp::min(
+                            segment_size,
+                            usize::from(initial_size.unwrap_or(INITIAL_MTU)),
+                        )
                     }
                 };
                 buf_capacity += next_datagram_size_limit;
@@ -726,6 +904,7 @@ impl Connection {
                 num_datagrams += 1;
                 coalesce = true;
                 pad_datagram = false;
+                fixed_size_initial = false;
                 datagram_start = buf.len();
 
                 debug_assert_eq!(
@@ -738,7 +917,18 @@ impl Connection {
                 // datagram.
                 // Finish current packet without adding extra padding
                 if let Some(builder) = builder_storage.take() {
-                    builder.finish_and_track(now, self, sent_frames.take(), buf);
+                    match fixed_size_initial && held_initial.is_none() {
+                        true => match self.hold_initial(builder, &mut sent_frames, buf) {
+                            Ok(held) => {
+                                buf_capacity -= held.tag_len();
+                                held_initial = Some(held);
+                            }
+                            Err(builder) => {
+                                builder.finish_and_track(now, self, sent_frames.take(), buf)
+                            }
+                        },
+                        false => builder.finish_and_track(now, self, sent_frames.take(), buf),
+                    }
                 }
             }
 
@@ -754,7 +944,11 @@ impl Connection {
             {
                 // A client stops both sending and processing Initial packets when it
                 // sends its first Handshake packet.
-                self.discard_space(now, SpaceId::Initial);
+                match held_initial {
+                    // Once the Initial packet in this datagram is finished
+                    Some(_) => discard_initial = true,
+                    None => self.discard_space(now, SpaceId::Initial),
+                }
             }
             if let Some(ref mut prev) = self.prev_crypto {
                 prev.update_unacked = false;
@@ -775,11 +969,22 @@ impl Connection {
                 ack_eliciting,
                 self,
             )?);
-            coalesce = coalesce && !builder.short_header;
+            datagram_group = Some(group);
+            coalesce =
+                coalesce && !builder.short_header && self.config.fingerprint.coalesce_packets;
+            match builder.ack_eliciting {
+                true => self.non_ack_eliciting_run = 0,
+                false => self.non_ack_eliciting_run += 1,
+            }
+            if self.defer_undecryptable && builder.short_header && builder.ack_eliciting {
+                // The kept packets follow this transmission, as quiche's alarm does
+                self.timers.set(Timer::ProcessUndecryptable, now);
+            }
 
             // https://tools.ietf.org/html/draft-ietf-quic-transport-34#section-14.1
             pad_datagram |=
                 space_id == SpaceId::Initial && (self.side.is_client() || ack_eliciting);
+            fixed_size_initial |= space_id == SpaceId::Initial && initial_size.is_some();
 
             if close {
                 trace!("sending CONNECTION_CLOSE");
@@ -847,7 +1052,7 @@ impl Connection {
 
             // Send an off-path PATH_RESPONSE. Prioritized over on-path data to ensure that path
             // validation can occur while the link is saturated.
-            if space_id == SpaceId::Data && num_datagrams == 1 {
+            if space_id == SpaceId::Data && num_datagrams == 1 && held_initial.is_none() {
                 if let Some((token, remote)) = self.path_responses.pop_off_path(self.path.remote) {
                     // `unwrap` guaranteed to succeed because `builder_storage` was populated just
                     // above.
@@ -877,8 +1082,15 @@ impl Connection {
                 }
             }
 
-            let sent =
-                self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let sent = self.populate_packet(
+                now,
+                space_id,
+                buf,
+                builder.datagram_start,
+                builder.max_size,
+                builder.exact_number,
+                builder.ack_eliciting,
+            );
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -895,14 +1107,29 @@ impl Connection {
                 "SendableFrames was {can_send:?}, but only ACKs have been written"
             );
             pad_datagram |= sent.requires_padding;
+            if mem::take(&mut self.end_datagram) {
+                coalesce = false;
+            }
 
-            if sent.largest_acked.is_some() {
+            if sent.acked_current {
                 self.spaces[space_id].pending_acks.acks_sent();
-                self.timers.stop(Timer::MaxAckDelay);
+                match space_id {
+                    SpaceId::Data => self.timers.stop(Timer::MaxAckDelay),
+                    // Only this policy delays Initial and Handshake acknowledgements; the
+                    // application data timer keeps running
+                    _ if self.config.fingerprint.ack_policy == AckPolicy::Quiche => {
+                        self.set_handshake_ack_timer()
+                    }
+                    // Upstream behaviour
+                    _ => self.timers.stop(Timer::MaxAckDelay),
+                }
             }
 
             // Keep information about the packet around until it gets finalized
             sent_frames = Some(sent);
+            if mem::take(&mut self.end_transmit) {
+                break;
+            }
 
             // Don't increment space_idx.
             // We stay in the current space and check if there is more data to send.
@@ -910,7 +1137,9 @@ impl Connection {
 
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
-            if pad_datagram {
+            let append_zeros =
+                fixed_size_initial && held_initial.is_none() && self.pad_initial(&mut builder);
+            if pad_datagram && !fixed_size_initial {
                 builder.pad_to(MIN_INITIAL_SIZE);
             }
 
@@ -925,6 +1154,16 @@ impl Connection {
 
             let last_packet_number = builder.exact_number;
             builder.finish_and_track(now, self, sent_frames, buf);
+            self.conclude_held_initial(
+                now,
+                &mut held_initial,
+                &mut discard_initial,
+                buf,
+                initial_size,
+            );
+            if append_zeros {
+                Self::append_zeros(buf, datagram_start, initial_size);
+            }
             self.path
                 .congestion
                 .on_sent(now, buf.len() as u64, last_packet_number);
@@ -942,10 +1181,7 @@ impl Connection {
         // Send MTU probe if necessary
         if buf.is_empty() && self.state.is_established() {
             let space_id = SpaceId::Data;
-            let probe_size = self
-                .path
-                .mtud
-                .poll_transmit(now, self.packet_number_filter.peek(&self.spaces[space_id]))?;
+            let probe_size = self.path.mtud.poll_transmit(now, self.peek_data_pn())?;
 
             let buf_capacity = probe_size as usize;
             buf.reserve(buf_capacity);
@@ -1079,6 +1315,17 @@ impl Connection {
         }
         let mut can_send = self.spaces[space_id].can_send(&self.streams);
         if space_id == SpaceId::Data {
+            let space = &self.spaces[space_id];
+            if self.config.fingerprint.early_connection_ids
+                && space.crypto.is_none()
+                && !space.ping_pending
+                && !space.immediate_ack_pending
+                && space.pending.is_empty_except_new_cids(&self.streams)
+            {
+                // Connection IDs issued early ride along with the first 0-RTT packet that carries
+                // application data, or else with the first 1-RTT packet, as neqo sends them
+                can_send.other = false;
+            }
             can_send.other |= self.can_send_1rtt(frame_space_1rtt);
         }
         can_send
@@ -1109,6 +1356,24 @@ impl Connection {
 
                 let was_anti_amplification_blocked = self.path.anti_amplification_blocked(1);
 
+                // Packets that arrived earlier come first
+                self.process_deferred_undecryptable();
+
+                if self.config.fingerprint.ack_each_datagram {
+                    // Acknowledgements that became due with earlier datagrams are sent as if they
+                    // had been sent before this one arrived
+                    let frame_space = usize::from(self.path.current_mtu());
+                    let generation = self.stats.udp_rx.datagrams;
+                    for space_id in SpaceId::iter() {
+                        let with_data = self.space_can_send(space_id, frame_space).other;
+                        let space = &mut self.spaces[space_id];
+                        if space.crypto.is_some() {
+                            let ecn = space.ecn_counters;
+                            space.pending_acks.queue_due_ack(ecn, with_data, generation);
+                        }
+                    }
+                }
+
                 self.stats.udp_rx.datagrams += 1;
                 self.stats.udp_rx.bytes += first_decode.len() as u64;
                 let data_len = first_decode.len();
@@ -1124,6 +1389,7 @@ impl Connection {
                     self.stats.udp_rx.bytes += data.len() as u64;
                     self.handle_coalesced(now, remote, ecn, data);
                 }
+                self.process_undecryptable();
 
                 self.config.qlog_sink.emit_recovery_metrics(
                     self.pto_count,
@@ -1181,8 +1447,15 @@ impl Connection {
                     self.kill(ConnectionError::TimedOut);
                 }
                 Timer::KeepAlive => {
-                    trace!("sending keep-alive");
-                    self.ping();
+                    if self.config.keep_alive_only_with_open_bidi_streams
+                        && !self.streams.has_open_bidi_streams()
+                    {
+                        // Let the connection idle out; the next packet re-arms the timer
+                        trace!("no open bidirectional stream, skipping keep-alive");
+                    } else {
+                        trace!("sending keep-alive");
+                        self.ping();
+                    }
                 }
                 Timer::LossDetection => {
                     self.on_loss_detection_timeout(now);
@@ -1225,6 +1498,26 @@ impl Connection {
                     self.spaces[SpaceId::Data]
                         .pending_acks
                         .on_max_ack_delay_timeout()
+                }
+                Timer::ProcessUndecryptable => {
+                    self.process_deferred_undecryptable();
+                }
+                Timer::FinishedHold => {
+                    trace!("sending the held Finished");
+                    self.finished_held = false;
+                }
+                Timer::HandshakeAckDelay => {
+                    trace!("handshake ack delay reached");
+                    for space in [SpaceId::Initial, SpaceId::Handshake] {
+                        let pending_acks = &mut self.spaces[space].pending_acks;
+                        if pending_acks
+                            .max_ack_delay_timeout(TIMER_GRANULARITY)
+                            .is_some_and(|t| t <= now)
+                        {
+                            pending_acks.on_max_ack_delay_timeout();
+                        }
+                    }
+                    self.set_handshake_ack_timer();
                 }
             }
         }
@@ -1660,6 +1953,10 @@ impl Connection {
         };
         self.spaces[space].loss_probes = self.spaces[space].loss_probes.saturating_add(count);
         self.pto_count = self.pto_count.saturating_add(1);
+        if let Some(pn) = self.shared_pn.as_mut() {
+            // Like quiche, skip a packet number to elicit an immediate acknowledgement
+            *pn += 1;
+        }
         self.set_loss_detection_timer(now);
     }
 
@@ -2097,6 +2394,9 @@ impl Connection {
             ));
         }
 
+        if space == SpaceId::Initial {
+            self.lock_version();
+        }
         let space = &mut self.spaces[space];
         let max = end.saturating_sub(space.crypto_stream.bytes_read());
         if max > self.config.crypto_buffer_size as u64 {
@@ -2109,6 +2409,7 @@ impl Connection {
         while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
             if self.crypto.read_handshake(&chunk.bytes)? {
+                self.handshake_data_ready = true;
                 self.events.push_back(Event::HandshakeDataReady);
             }
         }
@@ -2171,6 +2472,13 @@ impl Connection {
             );
         }
 
+        if space == SpaceId::Data && !self.config.fingerprint.early_key_update {
+            self.key_phase_size = crypto
+                .packet
+                .local
+                .confidentiality_limit()
+                .saturating_sub(KEY_UPDATE_MARGIN);
+        }
         self.spaces[space].crypto = Some(crypto);
         debug_assert!(space as usize > self.highest_space as usize);
         self.highest_space = space;
@@ -2188,9 +2496,11 @@ impl Connection {
             if let ConnectionSide::Client { token, .. } = &mut self.side {
                 *token = Bytes::new();
             }
+            self.discard_original_initial_keys();
         }
         let space = &mut self.spaces[space_id];
         space.crypto = None;
+        space.pending_acks.clear_queued();
         space.time_of_last_ack_eliciting_packet = None;
         space.loss_time = None;
         let sent_packets = mem::take(&mut space.sent_packets);
@@ -2209,11 +2519,15 @@ impl Connection {
     ) {
         self.path.total_recvd = self.path.total_recvd.saturating_add(data.len() as u64);
         let mut remaining = Some(data);
+        let versions = [
+            self.version,
+            self.alternative_version().unwrap_or(self.version),
+        ];
         while let Some(data) = remaining {
             match PartialDecode::new(
                 data,
                 &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
-                &[self.version],
+                &versions,
                 self.endpoint_config.grease_quic_bit,
             ) {
                 Ok((partial_decode, rest)) => {
@@ -2235,16 +2549,45 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
     ) {
+        if partial_decode.version().is_some_and(|v| v != self.version) {
+            self.handle_other_version(now, remote, ecn, partial_decode);
+            return;
+        }
+        if self.handshake_pending
+            && partial_decode.space() == Some(SpaceId::Data)
+            && !partial_decode.is_0rtt()
+            && self.spaces[SpaceId::Data].crypto.is_none()
+        {
+            // The 1-RTT keys follow once the crypto session has finished its asynchronous work
+            if self.undecryptable.len() < MAX_UNDECRYPTABLE_PACKETS {
+                trace!("keeping 1-RTT packet until the handshake continues");
+                self.undecryptable
+                    .push_back((now, remote, ecn, partial_decode));
+            }
+            return;
+        }
         if let Some(decoded) = packet_crypto::unprotect_header(
             partial_decode,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
         ) {
-            self.handle_packet(now, remote, ecn, decoded.packet, decoded.stateless_reset);
+            self.handle_packet(
+                now,
+                remote,
+                ecn,
+                decoded.packet,
+                decoded.stateless_reset,
+                false,
+            );
         }
     }
 
+    /// `already_decrypted`: `packet`'s payload was already decrypted in place with the keys
+    /// `decrypt_packet` would otherwise derive and use itself (the compatible-version-switch
+    /// path in `version_negotiation.rs` does this to authenticate a packet before committing to
+    /// the switch); `decrypt_packet` then skips the AEAD decrypt but still validates and derives
+    /// the packet number as usual.
     fn handle_packet(
         &mut self,
         now: Instant,
@@ -2252,6 +2595,7 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         packet: Option<Packet>,
         stateless_reset: bool,
+        already_decrypted: bool,
     ) {
         self.stats.udp_rx.ios += 1;
         if let Some(ref packet) = packet {
@@ -2275,7 +2619,7 @@ impl Connection {
         let decrypted = match packet {
             None => Err(None),
             Some(mut packet) => self
-                .decrypt_packet(now, &mut packet)
+                .decrypt_packet(now, &mut packet, already_decrypted)
                 .map(move |number| (packet, number)),
         };
         let result = match decrypted {
@@ -2409,7 +2753,9 @@ impl Connection {
             State::Established => {
                 match packet.header.space() {
                     SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
-                    _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
+                    _ if packet.header.has_frames() => {
+                        self.process_early_payload(now, number, packet)?
+                    }
                     _ => {
                         trace!("discarding unexpected pre-handshake packet");
                     }
@@ -2477,8 +2823,10 @@ impl Connection {
                 self.rem_cids.update_initial_cid(rem_cid);
                 self.rem_handshake_cid = rem_cid;
 
+                // The Retry acknowledges our first Initial, which need not be number 0
                 let space = &mut self.spaces[SpaceId::Initial];
-                if let Some(info) = space.take(0) {
+                let first = space.sent_packets.keys().next().copied();
+                if let Some(info) = first.and_then(|pn| space.take(pn)) {
                     self.on_packet_acked(now, info);
                 };
 
@@ -2531,7 +2879,7 @@ impl Connection {
                 }
                 self.on_path_validated();
 
-                self.process_early_payload(now, packet)?;
+                self.process_early_payload(now, number, packet)?;
                 if self.state.is_closed() {
                     return Ok(());
                 }
@@ -2541,53 +2889,11 @@ impl Connection {
                     return Ok(());
                 }
 
-                if self.side.is_client() {
-                    // Client-only because server params were set from the client's Initial
-                    let params =
-                        self.crypto
-                            .transport_parameters()?
-                            .ok_or_else(|| TransportError {
-                                code: TransportErrorCode::crypto(0x6d),
-                                frame: None,
-                                reason: "transport parameters missing".into(),
-                            })?;
-
-                    if self.has_0rtt() {
-                        if !self.crypto.early_data_accepted().unwrap() {
-                            debug_assert!(self.side.is_client());
-                            debug!("0-RTT rejected");
-                            self.accepted_0rtt = false;
-                            self.streams.zero_rtt_rejected();
-
-                            // Discard already-queued frames
-                            self.spaces[SpaceId::Data].pending = Retransmits::default();
-
-                            // Discard 0-RTT packets
-                            let sent_packets =
-                                mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
-                            for packet in sent_packets.into_values() {
-                                self.remove_in_flight(&packet);
-                            }
-                        } else {
-                            self.accepted_0rtt = true;
-                            params.validate_resumption_from(&self.peer_params)?;
-                        }
-                    }
-                    if let Some(token) = params.stateless_reset_token {
-                        self.endpoint_events
-                            .push_back(EndpointEventInner::ResetToken(self.path.remote, token));
-                    }
-                    self.handle_peer_params(params)?;
-                    self.issue_first_cids(now);
-                } else {
-                    // Server-only
-                    self.spaces[SpaceId::Data].pending.handshake_done = true;
-                    self.discard_space(now, SpaceId::Handshake);
+                let was_handshake = self.state.is_handshake();
+                self.complete_handshake(now)?;
+                if was_handshake && self.state.is_established() {
+                    self.hold_finished(now);
                 }
-
-                self.events.push_back(Event::Connected);
-                self.state = State::Established;
-                trace!("established");
                 Ok(())
             }
             Header::Initial(InitialHeader {
@@ -2610,23 +2916,17 @@ impl Connection {
                 }
 
                 let starting_space = self.highest_space;
-                self.process_early_payload(now, packet)?;
+                self.process_early_payload(now, number, packet)?;
 
                 if self.side.is_server()
                     && starting_space == SpaceId::Initial
                     && self.highest_space != SpaceId::Initial
                 {
-                    let params =
-                        self.crypto
-                            .transport_parameters()?
-                            .ok_or_else(|| TransportError {
-                                code: TransportErrorCode::crypto(0x6d),
-                                frame: None,
-                                reason: "transport parameters missing".into(),
-                            })?;
-                    self.handle_peer_params(params)?;
-                    self.issue_first_cids(now);
-                    self.init_0rtt();
+                    self.handle_client_params(now)?;
+                }
+                if !self.crypto.is_handshaking() {
+                    // A session that finished asynchronous work while this packet was processed
+                    self.complete_handshake(now)?;
                 }
                 Ok(())
             }
@@ -2660,10 +2960,102 @@ impl Connection {
         }
     }
 
+    /// Finish the handshake once the crypto session is no longer handshaking
+    fn complete_handshake(&mut self, now: Instant) -> Result<(), TransportError> {
+        if !self.state.is_handshake() {
+            return Ok(());
+        }
+        if self.side.is_client() {
+            // Client-only because server params were set from the client's Initial
+            let params = self
+                .crypto
+                .transport_parameters()?
+                .ok_or_else(|| TransportError {
+                    code: TransportErrorCode::crypto(0x6d),
+                    frame: None,
+                    reason: "transport parameters missing".into(),
+                })?;
+
+            if self.has_0rtt() {
+                if !self.crypto.early_data_accepted().unwrap() {
+                    debug_assert!(self.side.is_client());
+                    debug!("0-RTT rejected");
+                    self.accepted_0rtt = false;
+                    self.streams.zero_rtt_rejected();
+
+                    // Discard already-queued frames, except for connection IDs issued early,
+                    // which are still valid
+                    let space = &mut self.spaces[SpaceId::Data];
+                    let mut new_cids = mem::take(&mut space.pending.new_cids);
+                    space.pending = Retransmits::default();
+
+                    // Discard 0-RTT packets
+                    let sent_packets = mem::take(&mut space.sent_packets);
+                    for packet in sent_packets.into_values() {
+                        if let Some(retransmits) = packet.retransmits.get() {
+                            new_cids.extend(retransmits.new_cids.iter().cloned());
+                        }
+                        self.remove_in_flight(&packet);
+                    }
+                    self.spaces[SpaceId::Data].pending.new_cids = new_cids;
+                } else {
+                    self.accepted_0rtt = true;
+                    params.validate_resumption_from(&self.peer_params)?;
+                }
+            }
+            if let Some(token) = params.stateless_reset_token {
+                self.endpoint_events
+                    .push_back(EndpointEventInner::ResetToken(self.path.remote, token));
+            }
+            self.handle_peer_params(params)?;
+            self.issue_first_cids(now);
+        } else {
+            // Server-only
+            self.spaces[SpaceId::Data].pending.handshake_done = true;
+            self.discard_space(now, SpaceId::Handshake);
+        }
+
+        self.events.push_back(Event::Connected);
+        self.state = State::Established;
+        trace!("established");
+
+        if !self.undecryptable.is_empty()
+            && self.config.fingerprint.buffered_packet_processing
+                == BufferedPacketProcessing::AfterFirst1rttData
+        {
+            // Like quiche, send the Finished and the first 1-RTT data before looking at the kept
+            // packets, but not much later than that
+            trace!("deferring 1-RTT packets that arrived during the handshake");
+            self.defer_undecryptable = true;
+            self.timers.set(
+                Timer::ProcessUndecryptable,
+                now + MAX_UNDECRYPTABLE_DEFERRAL,
+            );
+        }
+        Ok(())
+    }
+
+    /// Take the client's transport parameters once a server has sent its first flight
+    fn handle_client_params(&mut self, now: Instant) -> Result<(), TransportError> {
+        let params = self
+            .crypto
+            .transport_parameters()?
+            .ok_or_else(|| TransportError {
+                code: TransportErrorCode::crypto(0x6d),
+                frame: None,
+                reason: "transport parameters missing".into(),
+            })?;
+        self.handle_peer_params(params)?;
+        self.issue_first_cids(now);
+        self.init_0rtt();
+        Ok(())
+    }
+
     /// Process an Initial or Handshake packet payload
     fn process_early_payload(
         &mut self,
         now: Instant,
+        number: Option<u64>,
         packet: Packet,
     ) -> Result<(), TransportError> {
         debug_assert_ne!(packet.header.space(), SpaceId::Data);
@@ -2704,13 +3096,41 @@ impl Connection {
             }
         }
 
+        let space = packet.header.space();
         if ack_eliciting {
-            // In the initial and handshake spaces, ACKs must be sent immediately
-            self.spaces[packet.header.space()]
-                .pending_acks
-                .set_immediate_ack_required();
+            self.spaces[space].pending_acks.ack_eliciting_received(now);
+        }
+        match self.config.fingerprint.ack_policy {
+            AckPolicy::Quiche => {
+                if let Some(number) = number {
+                    // quiche acknowledges after two ack-eliciting packets or after 1 ms
+                    if self.spaces[space].pending_acks.packet_received_quiche(
+                        now,
+                        number,
+                        ack_eliciting,
+                    ) {
+                        self.set_handshake_ack_timer();
+                    }
+                }
+            }
+            AckPolicy::Standard => {
+                if ack_eliciting {
+                    // In the initial and handshake spaces, ACKs must be sent immediately
+                    self.spaces[space].pending_acks.set_immediate_ack_required();
+                }
+            }
         }
 
+        if self.crypto.is_handshaking() {
+            // Learn whether the session continues asynchronously; if it already finished, the
+            // results are picked up here
+            let was_pending = self.handshake_pending;
+            match self.poll_crypto_session() {
+                Poll::Ready(Err(err)) => return Err(err),
+                Poll::Ready(Ok(())) if was_pending => self.check_handshake_data(),
+                _ => {}
+            }
+        }
         self.write_crypto();
         Ok(())
     }
@@ -2905,14 +3325,14 @@ impl Connection {
                         Ok(Some((retired, reset_token))) => {
                             let pending_retired =
                                 &mut self.spaces[SpaceId::Data].pending.retire_cids;
-                            /// Ensure `pending_retired` cannot grow without bound. Limit is
-                            /// somewhat arbitrary but very permissive.
-                            const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
+                            // Ensure `pending_retired` cannot grow without bound. Limit is
+                            // somewhat arbitrary but very permissive.
+                            let max_pending_retired_cids = self.rem_cids.capacity() as u64 * 10;
                             // We don't bother counting in-flight frames because those are bounded
                             // by congestion control.
                             if (pending_retired.len() as u64)
                                 .saturating_add(retired.end.saturating_sub(retired.start))
-                                > MAX_PENDING_RETIRED_CIDS
+                                > max_pending_retired_cids
                             {
                                 return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
                                     "queued too many retired CIDs",
@@ -3007,12 +3427,35 @@ impl Connection {
         }
 
         let space = &mut self.spaces[SpaceId::Data];
-        if space
-            .pending_acks
-            .packet_received(now, number, ack_eliciting, &space.dedup)
-        {
-            self.timers
-                .set(Timer::MaxAckDelay, now + self.ack_frequency.max_ack_delay);
+        if ack_eliciting {
+            space.pending_acks.ack_eliciting_received(now);
+        }
+        let mut ack_delay = self.ack_frequency.max_ack_delay;
+        if let Some(decimation) = &self.config.fingerprint.ack_decimation {
+            if !self.ack_frequency.controlled_by_peer()
+                && space.pending_acks.maybe_decimate(
+                    number,
+                    decimation.after_packets,
+                    decimation.packets_per_ack,
+                )
+            {
+                ack_delay = decimation.delay(self.path.rtt.min(), ack_delay);
+            }
+        }
+        let arm_timer = match self.config.fingerprint.ack_policy {
+            AckPolicy::Standard => {
+                space
+                    .pending_acks
+                    .packet_received(now, number, ack_eliciting, &space.dedup)
+            }
+            AckPolicy::Quiche => {
+                space
+                    .pending_acks
+                    .packet_received_quiche(now, number, ack_eliciting)
+            }
+        };
+        if arm_timer {
+            self.timers.set(Timer::MaxAckDelay, now + ack_delay);
         }
 
         // Issue stream ID credit due to ACKs of outgoing finish/resets and incoming finish/resets
@@ -3125,8 +3568,12 @@ impl Connection {
             return;
         }
 
-        // Subtract 1 to account for the CID we supplied while handshaking
-        let mut n = self.peer_params.issue_cids_limit() - 1;
+        // Subtract 1 to account for the CID we supplied while handshaking, and those requested
+        // before the handshake completed
+        let mut n = self
+            .peer_params
+            .issue_cids_limit()
+            .saturating_sub(1 + self.early_cids);
         if let ConnectionSide::Server { server_config } = &self.side {
             if server_config.has_preferred_address() {
                 // We also sent a CID in the transport parameters
@@ -3142,12 +3589,38 @@ impl Connection {
         now: Instant,
         space_id: SpaceId,
         buf: &mut Vec<u8>,
+        datagram_start: usize,
         max_size: usize,
         pn: u64,
+        ack_eliciting: bool,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
+        let payload_start = buf.len();
+        let trailing_ping = self.config.fingerprint.trailing_ping;
+        let bundle_acks = self.config.fingerprint.ack_policy == AckPolicy::Quiche;
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
+
+        // An ACK frame that was due after an earlier datagram gets a packet of its own, with other
+        // frames only if some were ready then. Packets of later spaces may share its datagram,
+        // as they would have after that datagram, see `datagram_group` in `poll_transmit`.
+        if let Some(queued) = space.pending_acks.pop_queued() {
+            Self::populate_queued_ack(
+                now,
+                self.receiving_ecn,
+                &mut sent,
+                queued,
+                buf,
+                &mut self.stats,
+            );
+            self.end_transmit = space_id == SpaceId::Data || space.pending_acks.can_send();
+            // Other frames, if any were ready then or a MAX_DATA frame has to follow a run of
+            // ACK-only packets
+            if !ack_eliciting {
+                return sent;
+            }
+        }
+
         space.pending_acks.maybe_ack_non_eliciting();
 
         // HANDSHAKE_DONE
@@ -3160,7 +3633,7 @@ impl Connection {
         }
 
         // PING
-        if mem::replace(&mut space.ping_pending, false) {
+        if !trailing_ping && mem::replace(&mut space.ping_pending, false) {
             trace!("PING");
             buf.write(frame::FrameType::PING);
             sent.non_retransmits = true;
@@ -3176,7 +3649,15 @@ impl Connection {
         }
 
         // ACK
-        if space.pending_acks.can_send() {
+        if sent.largest_acked.is_some() {
+            // Already written from an earlier datagram's state
+        } else if space.pending_acks.can_send()
+            || (bundle_acks
+                && ack_eliciting
+                && !is_0rtt
+                && space.pending_acks.has_unacked_ack_eliciting())
+        {
+            // quiche adds a pending acknowledgement to anything it sends
             Self::populate_acks(
                 now,
                 self.receiving_ecn,
@@ -3185,6 +3666,7 @@ impl Connection {
                 buf,
                 &mut self.stats,
             );
+            sent.acked_current = true;
         }
 
         // ACK_FREQUENCY
@@ -3245,7 +3727,26 @@ impl Connection {
         }
 
         // CRYPTO
-        while buf.len() + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
+        let mut crypto_done = is_0rtt;
+        if !is_0rtt && space_id == SpaceId::Initial && self.side.is_client() {
+            let outcome = crypto_framing::write_initial_crypto(
+                self.config.fingerprint.crypto_framing,
+                space,
+                buf,
+                crypto_framing::PacketBounds {
+                    datagram_start,
+                    payload_start,
+                    max_size,
+                },
+                &mut self.rng,
+                &mut sent,
+                &mut self.stats.frame_tx,
+            );
+            self.end_datagram |= outcome.end_datagram;
+            self.widen_next_pn |= outcome.widen_next_pn;
+            crypto_done = outcome.end_datagram;
+        }
+        while buf.len() + frame::Crypto::SIZE_BOUND < max_size && !crypto_done {
             let mut frame = match space.pending.crypto.pop_front() {
                 Some(x) => x,
                 None => break,
@@ -3286,6 +3787,18 @@ impl Connection {
             }
         }
 
+        if space_id == SpaceId::Data
+            && mem::take(&mut self.repeat_max_data)
+            && !is_0rtt
+            && !space.pending.max_data
+        {
+            // quiche repeats the limit it last advertised; a pending update would be new
+            self.streams.write_repeated_max_data(
+                buf,
+                &mut sent.retransmits,
+                &mut self.stats.frame_tx,
+            );
+        }
         if space_id == SpaceId::Data {
             self.streams.write_control_frames(
                 buf,
@@ -3388,11 +3901,23 @@ impl Connection {
         }
 
         // STREAM
+        let ping_last = trailing_ping && self.spaces[space_id].ping_pending;
         if space_id == SpaceId::Data {
+            // Leave room for a trailing PING
+            let max_size = max_size - usize::from(ping_last);
             sent.stream_frames =
                 self.streams
                     .write_stream_frames(buf, max_size, self.config.send_fairness);
             self.stats.frame_tx.stream += sent.stream_frames.len() as u64;
+        }
+
+        // PING, after the other frames
+        if ping_last && buf.len() < max_size {
+            trace!("PING");
+            self.spaces[space_id].ping_pending = false;
+            buf.write(frame::FrameType::PING);
+            sent.non_retransmits = true;
+            self.stats.frame_tx.ping += 1;
         }
 
         sent
@@ -3451,6 +3976,7 @@ impl Connection {
 
     /// Handle transport parameters received from the peer
     fn handle_peer_params(&mut self, params: TransportParameters) -> Result<(), TransportError> {
+        self.check_version_information(&params)?;
         if Some(self.orig_rem_cid) != params.initial_src_cid
             || (self.side.is_client()
                 && (Some(self.initial_dst_cid) != params.original_dst_cid
@@ -3490,6 +4016,7 @@ impl Connection {
         &mut self,
         now: Instant,
         packet: &mut Packet,
+        already_decrypted: bool,
     ) -> Result<Option<u64>, Option<TransportError>> {
         let result = packet_crypto::decrypt_packet_body(
             packet,
@@ -3498,6 +4025,7 @@ impl Connection {
             self.key_phase,
             self.prev_crypto.as_ref(),
             self.next_crypto.as_ref(),
+            already_decrypted,
         )?;
 
         let result = match result {
@@ -3594,6 +4122,7 @@ impl Connection {
             self.key_phase,
             self.prev_crypto.as_ref(),
             self.next_crypto.as_ref(),
+            false,
         )
         .ok()?;
 
@@ -3718,12 +4247,14 @@ impl Connection {
     /// rare. If `pn` is specified, may additionally change unpredictably due to variations in
     /// latency and packet loss.
     fn predict_1rtt_overhead(&self, pn: Option<u64>) -> usize {
+        let largest_acked = self.spaces[SpaceId::Data].largest_acked_packet;
         let pn_len = match pn {
-            Some(pn) => PacketNumber::new(
-                pn,
-                self.spaces[SpaceId::Data].largest_acked_packet.unwrap_or(0),
-            )
-            .len(),
+            Some(pn) => match self.config.fingerprint.packet_numbering {
+                PacketNumbering::Sequential { .. } => {
+                    PacketNumber::new_sequential(pn, largest_acked).len()
+                }
+                _ => PacketNumber::new(pn, largest_acked.unwrap_or(0)).len(),
+            },
             // Upper bound
             None => 4,
         };
@@ -4039,6 +4570,9 @@ const KEY_UPDATE_MARGIN: u64 = 10_000;
 struct SentFrames {
     retransmits: ThinRetransmits,
     largest_acked: Option<u64>,
+    /// Whether the packet carries an ACK frame of the current acknowledgement state, rather than
+    /// only one kept from an earlier datagram
+    acked_current: bool,
     stream_frames: StreamMetaVec,
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,

@@ -14,7 +14,7 @@ use pin_project_lite::pin_project;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 use tokio::sync::{Notify, futures::Notified, mpsc, oneshot};
-use tracing::{Instrument, Span, debug_span};
+use tracing::{Instrument, Span, debug, debug_span};
 
 use crate::{
     ConnectionEvent, Duration, Instant, VarInt,
@@ -249,7 +249,15 @@ impl Future for ConnectionDriver {
             conn.terminate(e, &self.0.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        // Let the crypto session continue a handshake that waited for asynchronous work, so that
+        // what it produced goes out with the following transmit
+        let now = conn.runtime.now();
+        conn.inner.poll_handshake(now, cx.waker());
+        // A `TransmitHold` defers transmission until the application has handed over all writes
+        let mut keep_going = match conn.transmit_held(now) {
+            true => false,
+            false => conn.drive_transmit(cx)?,
+        };
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -269,6 +277,28 @@ impl Future for ConnectionDriver {
             unreachable!("drained connections always have an error");
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+/// Longest time a [`TransmitHold`] defers transmission
+const MAX_TRANSMIT_HOLD: Duration = Duration::from_millis(2);
+
+/// Holds back the transmission of a connection's writes until dropped
+///
+/// Returned by [`Connection::hold_transmit()`].
+#[derive(Debug)]
+pub struct TransmitHold {
+    conn: Arc<ConnectionInner>,
+}
+
+impl Drop for TransmitHold {
+    fn drop(&mut self) {
+        let mut conn = self.conn.state.lock("TransmitHold::drop");
+        conn.transmit_holds -= 1;
+        if conn.transmit_holds == 0 {
+            conn.hold_deadline = None;
+            conn.wake();
+        }
     }
 }
 
@@ -420,6 +450,79 @@ impl Connection {
     pub fn close(&self, error_code: VarInt, reason: &[u8]) {
         let conn = &mut *self.0.state.lock("close");
         conn.close(error_code, Bytes::copy_from_slice(reason), &self.0.shared);
+    }
+
+    /// Close the connection immediately with a transport-level `CONNECTION_CLOSE` frame
+    ///
+    /// Like [`close()`](Self::close), but the peer receives a `CONNECTION_CLOSE` frame of type
+    /// `0x1c` with a transport error code instead of an application-level one (`0x1d`). Chrome,
+    /// for example, closes connections it no longer needs with `TransportErrorCode::NO_ERROR`,
+    /// frame type 0 and the reason `"70:net error"`. `frame_type` is the type of the frame that
+    /// caused the error; `None` is sent as 0.
+    pub fn close_transport(
+        &self,
+        error_code: proto::TransportErrorCode,
+        frame_type: Option<VarInt>,
+        reason: &[u8],
+    ) {
+        let conn = &mut *self.0.state.lock("close_transport");
+        let now = conn.runtime.now();
+        conn.inner
+            .close_transport(now, error_code, frame_type, Bytes::copy_from_slice(reason));
+        conn.terminate(ConnectionError::LocallyClosed, &self.0.shared);
+        conn.wake();
+    }
+
+    /// Discard the connection without sending anything to the peer
+    ///
+    /// Chromium drops QUIC sessions it no longer needs this way. Unlike [`close()`](Self::close),
+    /// the peer receives no `CONNECTION_CLOSE` frame and no other packet: the connection's state
+    /// is discarded at once and it stops transmitting, retransmitting and acknowledging. Pending
+    /// and future operations on the connection and its streams fail with
+    /// [`ConnectionError::LocallyClosed`], data not yet sent or acknowledged is lost, and dropping
+    /// the last handle afterwards sends nothing either. The connection driver finishes and the
+    /// endpoint forgets the connection right away, so an [`Endpoint`](crate::Endpoint) without
+    /// other connections becomes idle and, once its handles are dropped, closes its socket.
+    ///
+    /// The peer notices only when its idle timeout expires. Packets it sends meanwhile reach an
+    /// endpoint that no longer knows the connection; if that endpoint is still open, it answers
+    /// those addressed to a non-empty connection ID with a stateless reset.
+    pub fn abandon(&self) {
+        let conn = &mut *self.0.state.lock("abandon");
+        conn.inner.abandon();
+        conn.terminate(ConnectionError::LocallyClosed, &self.0.shared);
+        conn.wake();
+    }
+
+    /// Hold back transmission until the returned guard is dropped
+    ///
+    /// Every write, `finish` or `reset` wakes the connection driver on its own, so on a
+    /// multi-threaded runtime the driver may transmit between two writes that belong together,
+    /// e.g. an HTTP/3 request's HEADERS, its FIN and the PRIORITY_UPDATE and QPACK encoder data
+    /// that go with it. Browsers put such writes into one packet. Writes made while a
+    /// [`TransmitHold`] exists are only transmitted once the last hold on the connection is
+    /// dropped, and then together.
+    ///
+    /// Incoming packets are processed as usual while transmission is held. Acknowledgements that
+    /// become due meanwhile go out with the held writes, in the same packet, as browsers bundle
+    /// them into the packet they are building, but they are not held beyond the time RFC 9000
+    /// allows (see [`proto::Connection::ack_deadline`]).
+    ///
+    /// A hold never delays transmission by more than 2 ms, counted from when the first of the
+    /// current holds was taken, so a guard that is kept too long or leaked cannot stall the
+    /// connection (after a leak, later holds still end after at most 2 ms each). It also stops
+    /// holding back as soon as a write has to wait for peer flow control (including the local
+    /// send-window cap), which needs transmission to make progress.
+    #[must_use = "transmission resumes when the guard is dropped"]
+    pub fn hold_transmit(&self) -> TransmitHold {
+        let mut conn = self.0.state.lock("hold_transmit");
+        if conn.hold_deadline.is_none() {
+            conn.hold_deadline = Some(conn.runtime.now() + MAX_TRANSMIT_HOLD);
+        }
+        conn.transmit_holds += 1;
+        TransmitHold {
+            conn: self.0.0.clone(),
+        }
     }
 
     /// Transmit `data` as an unreliable, unordered application datagram
@@ -592,6 +695,18 @@ impl Connection {
             .lock("force_key_update")
             .inner
             .force_key_update()
+    }
+
+    /// Send a PING frame to the peer
+    ///
+    /// The frame goes into the next packet, together with whatever else is ready to be sent then.
+    /// Browsers send such packets on their own initiative: Chrome, for example, pings a
+    /// connection when its handshake completes and whenever it hands the connection to another
+    /// request, if the connection is to be kept alive.
+    pub fn ping(&self) {
+        let mut conn = self.0.state.lock("ping");
+        conn.inner.ping();
+        conn.wake();
     }
 
     /// Derive keying material from this connection's TLS session secrets.
@@ -907,6 +1022,8 @@ impl ConnectionRef {
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
+                transmit_holds: 0,
+                hold_deadline: None,
             }),
             shared: Shared::default(),
         }))
@@ -989,6 +1106,10 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
+    /// Number of live `TransmitHold`s
+    transmit_holds: usize,
+    /// When the current holds stop deferring transmission
+    hold_deadline: Option<Instant>,
 }
 
 impl State {
@@ -1058,6 +1179,28 @@ impl State {
         }
 
         Ok(false)
+    }
+
+    /// Whether a `TransmitHold` defers transmission at `now`
+    ///
+    /// Forgets the deadline once it has passed, so that it does not keep waking the driver.
+    fn transmit_held(&mut self, now: Instant) -> bool {
+        if self.transmit_holds == 0 {
+            return false;
+        }
+        match self.hold_deadline {
+            Some(deadline) if now < deadline => {
+                self.blocked_writers.is_empty()
+                    && self.error.is_none()
+                    && !self.inner.ack_deadline().is_some_and(|ack| ack <= now)
+            }
+            Some(_) => {
+                debug!("transmit hold expired");
+                self.hold_deadline = None;
+                false
+            }
+            None => false,
+        }
     }
 
     fn forward_endpoint_events(&mut self) {
@@ -1156,8 +1299,29 @@ impl State {
     fn drive_timer(&mut self, cx: &mut Context) -> bool {
         // Check whether we need to (re)set the timer. If so, we must poll again to ensure the
         // timer is registered with the runtime (and check whether it's already
-        // expired).
-        match self.inner.poll_timeout() {
+        // expired). A transmit hold also needs a wakeup when it stops deferring transmission.
+        let now = self.runtime.now();
+        let hold_deadline = match (self.transmit_holds, self.hold_deadline) {
+            (0, _) | (_, None) => None,
+            // A pending acknowledgement may end the hold earlier; one that is already late does
+            // not hold anything back and needs no wakeup
+            (_, Some(deadline)) => match self.inner.ack_deadline() {
+                Some(ack) if now < ack => Some(deadline.min(ack)),
+                _ => Some(deadline),
+            },
+        };
+        let timeout = match (self.inner.poll_timeout(), hold_deadline) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        };
+        match timeout {
+            Some(deadline) if deadline <= now => {
+                // Already due: handle it now rather than through the runtime's timer, which
+                // may round the deadline up to its next tick (about 15.6 ms on Windows)
+                self.inner.handle_timeout(now);
+                self.timer_deadline = None;
+                return true;
+            }
             Some(deadline) => {
                 if let Some(delay) = &mut self.timer {
                     // There is no need to reset the tokio timer if the deadline

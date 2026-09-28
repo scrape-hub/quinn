@@ -9,6 +9,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE-APACHE)
 
+> **About this fork:** the `koon` branch adds options that reproduce the QUIC wire behaviour of
+> Chromium, Firefox and Safari (`FingerprintConfig`, `TransportParameterLayout`), crypto sessions that
+> finish the handshake asynchronously, QUIC version 2 with compatible version negotiation, and
+> `Connection::abandon`. Parts of it are translated from [QUICHE](https://github.com/google/quiche)
+> (BSD-3-Clause) and [neqo](https://github.com/mozilla/neqo) (MIT or Apache-2.0); see
+> [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES) and the [licenses](licenses) directory.
+
 Quinn is a pure-Rust, async-compatible implementation of the IETF [QUIC][quic] transport protocol.
 The project was founded by [Dirkjan Ochtman](https://github.com/djc) and
 [Benjamin Saunders](https://github.com/Ralith) as a side project in 2018, and has seen more than

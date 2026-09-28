@@ -30,6 +30,8 @@ mod cid_queue;
 pub mod coding;
 mod constant_time;
 mod range_set;
+#[cfg(test)]
+mod test_profiles;
 #[cfg(all(test, any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")))]
 mod tests;
 pub mod transport_parameters;
@@ -59,8 +61,13 @@ mod config;
 #[cfg(feature = "qlog")]
 pub use config::QlogConfig;
 pub use config::{
-    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MtuDiscoveryConfig,
-    ServerConfig, StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
+    AckDecimation, AckFrequencyConfig, AckPolicy, BufferedPacketProcessing, ClientConfig,
+    ConfigError, CryptoFraming, EndpointConfig, FingerprintConfig, FirstPacketNumber,
+    GreaseVersion, IdleTimeout, InitialPadding, MAX_AVAILABLE_VERSIONS,
+    MAX_EXTRA_TRANSPORT_PARAMETER_LEN, MAX_EXTRA_TRANSPORT_PARAMETERS, MAX_FIRST_PACKET_NUMBER,
+    MtuDiscoveryConfig, PacketNumbering, PacketPadding, ServerConfig, SpinBit, StdSystemTime,
+    TimeSource, TransportConfig, TransportParameterLayout, TransportParameterOrder,
+    ValidationTokenConfig, VersionInformation,
 };
 
 pub mod crypto;
@@ -166,6 +173,12 @@ pub const DEFAULT_SUPPORTED_VERSIONS: &[u32] = &[
     0xff00_0021,
     0xff00_0022,
 ];
+
+/// QUIC version 2 (RFC 9369)
+///
+/// Not among the [`DEFAULT_SUPPORTED_VERSIONS`]: an endpoint uses it once it is added to
+/// [`EndpointConfig::supported_versions`](crate::EndpointConfig::supported_versions).
+pub const QUIC_VERSION_2: u32 = 0x6b33_43cf;
 
 /// Whether an endpoint was the initiator of a connection
 #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]

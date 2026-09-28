@@ -5,6 +5,7 @@ use bytes::{Buf, BufMut};
 use crate::{
     coding::{self, BufExt, BufMutExt},
     frame,
+    varint::VarInt,
 };
 
 /// Transport-level errors occur when a peer violates the protocol specification
@@ -69,6 +70,12 @@ impl From<Code> for u64 {
     }
 }
 
+impl From<VarInt> for Code {
+    fn from(x: VarInt) -> Self {
+        Self(x.into_inner())
+    }
+}
+
 macro_rules! errors {
     {$($name:ident($val:expr) $desc:expr;)*} => {
         #[allow(non_snake_case, unused)]
@@ -129,4 +136,5 @@ errors! {
     KEY_UPDATE_ERROR(0xE) "key update error";
     AEAD_LIMIT_REACHED(0xF) "the endpoint has reached the confidentiality or integrity limit for the AEAD algorithm";
     NO_VIABLE_PATH(0x10) "no viable network path exists";
+    VERSION_NEGOTIATION_ERROR(0x11) "the version negotiation failed";
 }

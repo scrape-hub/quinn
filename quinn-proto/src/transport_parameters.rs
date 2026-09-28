@@ -16,14 +16,25 @@ use rand::{Rng as _, RngCore, seq::SliceRandom as _};
 use thiserror::Error;
 
 use crate::{
-    LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT, RESET_TOKEN_SIZE, ResetToken, Side,
-    TIMER_GRANULARITY, TransportError, VarInt,
+    LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT, QUIC_VERSION_2, RESET_TOKEN_SIZE, ResetToken,
+    Side, TIMER_GRANULARITY, TransportError, VarInt,
     cid_generator::ConnectionIdGenerator,
-    cid_queue::CidQueue,
     coding::{BufExt, BufMutExt, UnexpectedEnd},
-    config::{EndpointConfig, ServerConfig, TransportConfig},
+    config::{
+        EndpointConfig, GreaseVersion, MAX_AVAILABLE_VERSIONS, MAX_EXTRA_TRANSPORT_PARAMETER_LEN,
+        MAX_EXTRA_TRANSPORT_PARAMETERS, MIN_ACK_DELAY_DRAFT07, ServerConfig, TransportConfig,
+        TransportParameterLayout, TransportParameterOrder, VERSION_INFORMATION_ID,
+        VersionInformation,
+    },
     shared::ConnectionId,
 };
+
+/// RFC 9000's default `ack_delay_exponent`, used to decode a peer's ACK Delay when its
+/// transport parameters don't include one. Must match `ack_delay_exponent`'s default in the
+/// `apply_params!` list below (kept as a separate constant: that list's defaults are untyped
+/// integer literals, inferred as `u32` or `u64` depending on where each is used, which a named
+/// constant with one fixed type can't be).
+pub(crate) const DEFAULT_ACK_DELAY_EXPONENT: u32 = 3;
 
 // Apply a given macro to a list of all the transport parameters having integer types, along with
 // their codes and default values. Using this helps us avoid error-prone duplication of the
@@ -105,11 +116,22 @@ macro_rules! make_struct {
             /// When present, it is included during serialization but ignored during deserialization.
             pub(crate) grease_transport_parameter: Option<ReservedTransportParameter>,
 
-            /// Defines the order in which transport parameters are serialized.
+            /// Codepoint under which `min_ack_delay` is serialized
+            pub(crate) min_ack_delay_id: VarInt,
+            /// `version_information` (RFC 9368): sent if configured or if QUIC version 2 is in
+            /// use; the peer's is only acted on by endpoints that send one themselves
+            pub(crate) version_information: Option<VersionInformationParameter>,
+            /// Parameters copied verbatim from the configuration, included during serialization
+            /// only
+            pub(crate) extra_parameters:
+                [Option<RawTransportParameter>; MAX_EXTRA_TRANSPORT_PARAMETERS],
+
+            /// Defines the order in which transport parameters are serialized, as indices of
+            /// serialization slots (see [`WriteSlot`])
             ///
             /// This field is initialized only for outgoing `TransportParameters` instances and
             /// is set to `None` for `TransportParameters` received from a peer.
-            pub(crate) write_order: Option<[u8; TransportParameterId::SUPPORTED.len()]>,
+            pub(crate) write_order: Option<[u8; WRITE_SLOTS]>,
         }
 
         // We deliberately don't implement the `Default` trait, since that would be public, and
@@ -132,6 +154,9 @@ macro_rules! make_struct {
                     stateless_reset_token: None,
                     preferred_address: None,
                     grease_transport_parameter: None,
+                    min_ack_delay_id: VarInt::from_u64(MIN_ACK_DELAY_DRAFT07).unwrap(),
+                    version_information: None,
+                    extra_parameters: [None; MAX_EXTRA_TRANSPORT_PARAMETERS],
                     write_order: None,
                 }
             }
@@ -148,39 +173,163 @@ impl TransportParameters {
         cid_gen: &dyn ConnectionIdGenerator,
         initial_src_cid: ConnectionId,
         server_config: Option<&ServerConfig>,
+        version: u32,
         rng: &mut impl RngCore,
     ) -> Self {
-        Self {
+        let layout = &config.transport_parameter_layout;
+        let windows = config.stream_receive_windows();
+        let mut params = Self {
             initial_src_cid: Some(initial_src_cid),
             initial_max_streams_bidi: config.max_concurrent_bidi_streams,
             initial_max_streams_uni: config.max_concurrent_uni_streams,
             initial_max_data: config.receive_window,
-            initial_max_stream_data_bidi_local: config.stream_receive_window,
-            initial_max_stream_data_bidi_remote: config.stream_receive_window,
-            initial_max_stream_data_uni: config.stream_receive_window,
+            initial_max_stream_data_bidi_local: windows.bidi_local,
+            initial_max_stream_data_bidi_remote: windows.bidi_remote,
+            initial_max_stream_data_uni: windows.uni,
             max_udp_payload_size: endpoint_config.max_udp_payload_size,
             max_idle_timeout: config.max_idle_timeout.unwrap_or(VarInt(0)),
+            // Rounded up, so that the peer never expects a shorter delay than we might take
+            max_ack_delay: VarInt::from_u64(config.max_ack_delay.as_micros().div_ceil(1000) as u64)
+                .unwrap(),
             disable_active_migration: server_config.is_some_and(|c| !c.migration),
-            active_connection_id_limit: if cid_gen.cid_len() == 0 {
+            active_connection_id_limit: if cid_gen.cid_len() == 0
+                && !layout.connection_id_limit_with_empty_cid
+            {
                 2 // i.e. default, i.e. unsent
             } else {
-                CidQueue::LEN as u32
+                config.remote_cid_limit()
             }
             .into(),
             max_datagram_frame_size: config
                 .datagram_receive_buffer_size
-                .map(|x| (x.min(u16::MAX.into()) as u16).into()),
+                .map(|buffer| match config.max_datagram_frame_size {
+                    Some(size) => size.min(VarInt::from_u64(buffer as u64).unwrap_or(VarInt::MAX)),
+                    None => (buffer.min(u16::MAX.into()) as u16).into(),
+                }),
             grease_quic_bit: endpoint_config.grease_quic_bit,
-            min_ack_delay: Some(
-                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
-            ),
-            grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
-            write_order: Some({
-                let mut order = std::array::from_fn(|i| i as u8);
-                order.shuffle(rng);
-                order
+            min_ack_delay: layout.min_ack_delay_id.map(|_| {
+                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap()
             }),
+            min_ack_delay_id: layout
+                .min_ack_delay_id
+                .unwrap_or(VarInt::from_u64(MIN_ACK_DELAY_DRAFT07).unwrap()),
+            grease_transport_parameter: layout
+                .grease
+                .then(|| ReservedTransportParameter::random(rng)),
             ..Self::default()
+        };
+        // RFC 9369, section 4: endpoints that support version 2 send version_information
+        let supports_v2 = match server_config {
+            None => version == QUIC_VERSION_2,
+            Some(_) => endpoint_config.supported_versions.contains(&QUIC_VERSION_2),
+        };
+        let info = match &layout.version_information {
+            Some(info) => Some(info.clone()),
+            None if supports_v2 && server_config.is_some() => Some(VersionInformation::new(
+                endpoint_config.supported_versions.clone(),
+            )),
+            None if supports_v2 => Some(VersionInformation::new(vec![version])),
+            None => None,
+        };
+        if let Some(info) = &info {
+            params.version_information = Some(VersionInformationParameter::new(info, version, rng));
+        }
+        for (slot, (id, value)) in params.extra_parameters.iter_mut().zip(&layout.extra) {
+            *slot = Some(RawTransportParameter::new(*id, value));
+        }
+        params.write_order = Some(params.compute_write_order(layout, rng));
+        params
+    }
+
+    /// Choose the serialization order of the parameters according to `layout`
+    fn compute_write_order(
+        &self,
+        layout: &TransportParameterLayout,
+        rng: &mut impl RngCore,
+    ) -> [u8; WRITE_SLOTS] {
+        let mut order = std::array::from_fn(|i| i as u8);
+        match &layout.order {
+            TransportParameterOrder::Random => {
+                if self.version_information.is_none() && self.extra_parameters[0].is_none() {
+                    // Only the upstream parameters can be present: shuffle exactly those, which
+                    // consumes the same randomness as upstream Quinn
+                    order[..TransportParameterId::SUPPORTED.len()].shuffle(rng);
+                } else {
+                    order.shuffle(rng);
+                }
+            }
+            TransportParameterOrder::Fixed(ids) => {
+                let mut taken = [false; WRITE_SLOTS];
+                let mut n = 0;
+                for id in ids {
+                    let found = (0..WRITE_SLOTS)
+                        .find(|&slot| !taken[slot] && self.slot_id(slot) == Some(id.into_inner()));
+                    if let Some(slot) = found {
+                        taken[slot] = true;
+                        order[n] = slot as u8;
+                        n += 1;
+                    }
+                }
+                for slot in self.remaining_slots_by_id(&taken) {
+                    order[n] = slot as u8;
+                    n += 1;
+                }
+            }
+            TransportParameterOrder::Rotated(ids) => {
+                let mut taken = [false; WRITE_SLOTS];
+                let mut listed = Vec::new();
+                for id in ids {
+                    let found = (0..WRITE_SLOTS).find(|&slot| {
+                        !taken[slot]
+                            && self.slot_id(slot) == Some(id.into_inner())
+                            && self.slot_is_sent(slot)
+                    });
+                    if let Some(slot) = found {
+                        taken[slot] = true;
+                        listed.push(slot);
+                    }
+                }
+                if !listed.is_empty() {
+                    let start = (rng.next_u32() as usize) % listed.len();
+                    listed.rotate_left(start);
+                }
+                let rest = self.remaining_slots_by_id(&taken);
+                for (n, slot) in listed.into_iter().chain(rest).enumerate() {
+                    order[n] = slot as u8;
+                }
+            }
+        }
+        order
+    }
+
+    /// The slots not marked in `taken`, sorted by [`Self::slot_id`] (unknown-id slots last)
+    fn remaining_slots_by_id(&self, taken: &[bool; WRITE_SLOTS]) -> Vec<usize> {
+        let mut rest = (0..WRITE_SLOTS)
+            .filter(|&slot| !taken[slot])
+            .collect::<Vec<_>>();
+        rest.sort_by_key(|&slot| self.slot_id(slot).unwrap_or(u64::MAX));
+        rest
+    }
+
+    /// Whether the given slot writes anything
+    fn slot_is_sent(&self, slot: usize) -> bool {
+        let mut buf = Vec::new();
+        self.write_slot(slot as u8, &mut buf);
+        !buf.is_empty()
+    }
+
+    /// Identifier serialized for the given slot, if it can be determined
+    fn slot_id(&self, slot: usize) -> Option<u64> {
+        match WriteSlot::from_index(slot) {
+            WriteSlot::Standard(TransportParameterId::ReservedTransportParameter) => {
+                self.grease_transport_parameter.map(|x| x.id.into_inner())
+            }
+            WriteSlot::Standard(TransportParameterId::MinAckDelayDraft07) => {
+                Some(self.min_ack_delay_id.into_inner())
+            }
+            WriteSlot::Standard(id) => Some(id as u64),
+            WriteSlot::VersionInformation => Some(VERSION_INFORMATION_ID),
+            WriteSlot::Extra(i) => self.extra_parameters[i].map(|x| x.id.into_inner()),
         }
     }
 
@@ -312,94 +461,142 @@ impl TransportParameters {
             .as_ref()
             .unwrap_or(&std::array::from_fn(|i| i as u8))
         {
-            let id = TransportParameterId::SUPPORTED[*idx as usize];
-            match id {
-                TransportParameterId::ReservedTransportParameter => {
-                    if let Some(param) = self.grease_transport_parameter {
-                        param.write(w);
-                    }
+            self.write_slot(*idx, w);
+        }
+    }
+
+    /// Encode the parameter of one serialization slot, if it is sent
+    fn write_slot<W: BufMut>(&self, idx: u8, w: &mut W) {
+        let id = match WriteSlot::from_index(idx as usize) {
+            WriteSlot::Standard(id) => id,
+            WriteSlot::VersionInformation => {
+                if let Some(ref info) = self.version_information {
+                    info.write(w);
                 }
-                TransportParameterId::StatelessResetToken => {
-                    if let Some(ref x) = self.stateless_reset_token {
-                        w.write_var(id as u64);
-                        w.write_var(16);
-                        w.put_slice(x);
-                    }
+                return;
+            }
+            WriteSlot::Extra(i) => {
+                if let Some(ref param) = self.extra_parameters[i] {
+                    param.write(w);
                 }
-                TransportParameterId::DisableActiveMigration => {
-                    if self.disable_active_migration {
-                        w.write_var(id as u64);
-                        w.write_var(0);
-                    }
+                return;
+            }
+        };
+        match id {
+            TransportParameterId::ReservedTransportParameter => {
+                if let Some(param) = self.grease_transport_parameter {
+                    param.write(w);
                 }
-                TransportParameterId::MaxDatagramFrameSize => {
-                    if let Some(x) = self.max_datagram_frame_size {
-                        w.write_var(id as u64);
-                        w.write_var(x.size() as u64);
-                        w.write(x);
-                    }
+            }
+            TransportParameterId::StatelessResetToken => {
+                if let Some(ref x) = self.stateless_reset_token {
+                    w.write_var(id as u64);
+                    w.write_var(16);
+                    w.put_slice(x);
                 }
-                TransportParameterId::PreferredAddress => {
-                    if let Some(ref x) = self.preferred_address {
-                        w.write_var(id as u64);
-                        w.write_var(x.wire_size() as u64);
-                        x.write(w);
-                    }
+            }
+            TransportParameterId::DisableActiveMigration => {
+                if self.disable_active_migration {
+                    w.write_var(id as u64);
+                    w.write_var(0);
                 }
-                TransportParameterId::OriginalDestinationConnectionId => {
-                    if let Some(ref cid) = self.original_dst_cid {
-                        w.write_var(id as u64);
-                        w.write_var(cid.len() as u64);
-                        w.put_slice(cid);
-                    }
+            }
+            TransportParameterId::MaxDatagramFrameSize => {
+                if let Some(x) = self.max_datagram_frame_size {
+                    w.write_var(id as u64);
+                    w.write_var(x.size() as u64);
+                    w.write(x);
                 }
-                TransportParameterId::InitialSourceConnectionId => {
-                    if let Some(ref cid) = self.initial_src_cid {
-                        w.write_var(id as u64);
-                        w.write_var(cid.len() as u64);
-                        w.put_slice(cid);
-                    }
+            }
+            TransportParameterId::PreferredAddress => {
+                if let Some(ref x) = self.preferred_address {
+                    w.write_var(id as u64);
+                    w.write_var(x.wire_size() as u64);
+                    x.write(w);
                 }
-                TransportParameterId::RetrySourceConnectionId => {
-                    if let Some(ref cid) = self.retry_src_cid {
-                        w.write_var(id as u64);
-                        w.write_var(cid.len() as u64);
-                        w.put_slice(cid);
-                    }
+            }
+            TransportParameterId::OriginalDestinationConnectionId => {
+                if let Some(ref cid) = self.original_dst_cid {
+                    w.write_var(id as u64);
+                    w.write_var(cid.len() as u64);
+                    w.put_slice(cid);
                 }
-                TransportParameterId::GreaseQuicBit => {
-                    if self.grease_quic_bit {
-                        w.write_var(id as u64);
-                        w.write_var(0);
-                    }
+            }
+            TransportParameterId::InitialSourceConnectionId => {
+                if let Some(ref cid) = self.initial_src_cid {
+                    w.write_var(id as u64);
+                    w.write_var(cid.len() as u64);
+                    w.put_slice(cid);
                 }
-                TransportParameterId::MinAckDelayDraft07 => {
-                    if let Some(x) = self.min_ack_delay {
-                        w.write_var(id as u64);
-                        w.write_var(x.size() as u64);
-                        w.write(x);
-                    }
+            }
+            TransportParameterId::RetrySourceConnectionId => {
+                if let Some(ref cid) = self.retry_src_cid {
+                    w.write_var(id as u64);
+                    w.write_var(cid.len() as u64);
+                    w.put_slice(cid);
                 }
-                id => {
-                    macro_rules! write_params {
-                        {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
-                            match id {
-                                $(TransportParameterId::$id => {
-                                    if self.$name.0 != $default {
-                                        w.write_var(id as u64);
-                                        w.write(VarInt::try_from(self.$name.size()).unwrap());
-                                        w.write(self.$name);
-                                    }
-                                })*,
-                                _ => {
-                                    unimplemented!("Missing implementation of write for transport parameter with code {id:?}");
+            }
+            TransportParameterId::GreaseQuicBit => {
+                if self.grease_quic_bit {
+                    w.write_var(id as u64);
+                    w.write_var(0);
+                }
+            }
+            TransportParameterId::MinAckDelayDraft07 => {
+                if let Some(x) = self.min_ack_delay {
+                    w.write(self.min_ack_delay_id);
+                    w.write_var(x.size() as u64);
+                    w.write(x);
+                }
+            }
+            id => {
+                macro_rules! write_params {
+                    {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+                        match id {
+                            $(TransportParameterId::$id => {
+                                if self.$name.0 != $default {
+                                    w.write_var(id as u64);
+                                    w.write(VarInt::try_from(self.$name.size()).unwrap());
+                                    w.write(self.$name);
                                 }
+                            })*,
+                            _ => {
+                                unimplemented!("Missing implementation of write for transport parameter with code {id:?}");
                             }
                         }
                     }
-                    apply_params!(write_params);
                 }
+                apply_params!(write_params);
             }
+        }
+    }
+
+    /// Encode only the transport parameters a split Encrypted Client Hello
+    /// sends in its ClientHelloOuter, mirroring Firefox's neqo
+    /// (`neqo_transport::tparams::TransportParameters::filter_ch_outer`):
+    /// the outer hello is a fallback the server only completes if it cannot
+    /// or will not accept the real (inner, encrypted) one, so most
+    /// parameters (the ones about streams, flow control and migration)
+    /// would be meaningless there and would leak real, distinguishing
+    /// values through a hello otherwise meant to look generic. neqo's own
+    /// allowlist has 8 entries, but for a stock client only three ever hold
+    /// a value (the rest are server-only or never set to a non-default
+    /// one): `max_ack_delay`, `initial_src_cid` and `version_information`,
+    /// in ascending transport parameter ID order. This never changes the
+    /// real set `write` encodes for the inner hello.
+    pub fn write_ech_outer<W: BufMut>(&self, w: &mut W) {
+        if self.max_ack_delay.0 != 25 {
+            w.write_var(TransportParameterId::MaxAckDelay as u64);
+            w.write_var(self.max_ack_delay.size() as u64);
+            w.write(self.max_ack_delay);
+        }
+        if let Some(ref cid) = self.initial_src_cid {
+            w.write_var(TransportParameterId::InitialSourceConnectionId as u64);
+            w.write_var(cid.len() as u64);
+            w.put_slice(cid);
+        }
+        if let Some(ref info) = self.version_information {
+            info.write(w);
         }
     }
 
@@ -429,6 +626,15 @@ impl TransportParameters {
                 return Err(Error::Malformed);
             }
             let len = len as usize;
+            if id == VERSION_INFORMATION_ID {
+                let value = r.copy_to_bytes(len);
+                params.version_information = Some(match params.version_information {
+                    // A repeated parameter is malformed (RFC 9000, section 7.4)
+                    Some(_) => VersionInformationParameter::read(side, &[]),
+                    None => VersionInformationParameter::read(side, &value),
+                });
+                continue;
+            }
             let Ok(id) = TransportParameterId::try_from(id) else {
                 // unknown transport parameters are ignored
                 r.advance(len);
@@ -529,6 +735,158 @@ impl TransportParameters {
         }
 
         Ok(params)
+    }
+}
+
+/// Number of serialization slots: the parameters Quinn knows, `version_information` and the extra
+/// parameters from the configuration
+const WRITE_SLOTS: usize =
+    TransportParameterId::SUPPORTED.len() + 1 + MAX_EXTRA_TRANSPORT_PARAMETERS;
+
+/// What a serialization slot of [`TransportParameters::write_order`] refers to
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum WriteSlot {
+    /// A parameter from [`TransportParameterId::SUPPORTED`]
+    Standard(TransportParameterId),
+    /// `version_information`
+    VersionInformation,
+    /// An entry of [`TransportParameters::extra_parameters`]
+    Extra(usize),
+}
+
+impl WriteSlot {
+    fn from_index(index: usize) -> Self {
+        let supported = TransportParameterId::SUPPORTED.len();
+        match index {
+            i if i < supported => Self::Standard(TransportParameterId::SUPPORTED[i]),
+            i if i == supported => Self::VersionInformation,
+            i => Self::Extra(i - supported - 1),
+        }
+    }
+}
+
+/// The `version_information` transport parameter (RFC 9368)
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct VersionInformationParameter {
+    chosen: u32,
+    /// The available versions; of a received parameter, the first [`MAX_AVAILABLE_VERSIONS`]
+    available: [u32; MAX_AVAILABLE_VERSIONS],
+    len: u8,
+    /// Whether the parameter is well-formed (RFC 9368, section 4); a sent one always is
+    valid: bool,
+}
+
+impl VersionInformationParameter {
+    /// Resolve the configured content, drawing the GREASE version and its position from `rng`
+    fn new(config: &VersionInformation, version: u32, rng: &mut impl RngCore) -> Self {
+        // Reserved versions have the form 0x?a?a?a?a (RFC 9000, section 15)
+        fn grease_version(rng: &mut impl RngCore) -> u32 {
+            rng.next_u32() & 0xf0f0_f0f0 | 0x0a0a_0a0a
+        }
+        let mut list = config.available.clone();
+        match config.grease {
+            GreaseVersion::None => {}
+            GreaseVersion::At(index) => {
+                let value = grease_version(rng);
+                list.insert(index.min(list.len()), value);
+            }
+            GreaseVersion::Random => {
+                let index = rng.random_range(0..=list.len());
+                let value = grease_version(rng);
+                list.insert(index, value);
+            }
+        }
+        list.truncate(MAX_AVAILABLE_VERSIONS);
+        let mut available = [0; MAX_AVAILABLE_VERSIONS];
+        available[..list.len()].copy_from_slice(&list);
+        Self {
+            chosen: version,
+            available,
+            len: list.len() as u8,
+            valid: true,
+        }
+    }
+
+    /// Decode a parameter received by `side`
+    ///
+    /// Never fails: a malformed parameter is marked as such, and only endpoints that take part in
+    /// version negotiation reject it.
+    pub(crate) fn read(side: Side, value: &[u8]) -> Self {
+        let mut this = Self {
+            chosen: 0,
+            available: [0; MAX_AVAILABLE_VERSIONS],
+            len: 0,
+            valid: false,
+        };
+        if value.len() < 4 || value.len() % 4 != 0 {
+            return this;
+        }
+        let mut versions = value
+            .chunks_exact(4)
+            .map(|x| u32::from_be_bytes(x.try_into().unwrap()));
+        this.chosen = versions.next().unwrap();
+        let mut valid = this.chosen != 0;
+        let mut listed = false;
+        for version in versions {
+            valid &= version != 0;
+            listed |= version == this.chosen;
+            if usize::from(this.len) < MAX_AVAILABLE_VERSIONS {
+                this.available[usize::from(this.len)] = version;
+                this.len += 1;
+            }
+        }
+        // A client's chosen version must be among its available versions
+        this.valid = valid && (side.is_client() || listed);
+        this
+    }
+
+    pub(crate) fn chosen(&self) -> u32 {
+        self.chosen
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// Whether `version` is among the available versions
+    pub(crate) fn lists(&self, version: u32) -> bool {
+        self.available[..usize::from(self.len)].contains(&version)
+    }
+
+    fn write(&self, w: &mut impl BufMut) {
+        w.write_var(VERSION_INFORMATION_ID);
+        w.write_var(4 + 4 * u64::from(self.len));
+        w.write(self.chosen);
+        for version in &self.available[..usize::from(self.len)] {
+            w.write(*version);
+        }
+    }
+}
+
+/// A transport parameter written verbatim from the configuration
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct RawTransportParameter {
+    id: VarInt,
+    len: u8,
+    value: [u8; MAX_EXTRA_TRANSPORT_PARAMETER_LEN],
+}
+
+impl RawTransportParameter {
+    fn new(id: VarInt, value: &[u8]) -> Self {
+        let len = value.len().min(MAX_EXTRA_TRANSPORT_PARAMETER_LEN);
+        let mut buf = [0; MAX_EXTRA_TRANSPORT_PARAMETER_LEN];
+        buf[..len].copy_from_slice(&value[..len]);
+        Self {
+            id,
+            len: len as u8,
+            value: buf,
+        }
+    }
+
+    fn write(&self, w: &mut impl BufMut) {
+        w.write(self.id);
+        w.write_var(u64::from(self.len));
+        w.put_slice(&self.value[..usize::from(self.len)]);
     }
 }
 
@@ -722,7 +1080,18 @@ fn decode_cid(len: usize, value: &mut Option<ConnectionId>, r: &mut impl Buf) ->
 
 #[cfg(test)]
 mod test {
+    use bytes::Bytes;
+    use rand::SeedableRng;
+
     use super::*;
+    use crate::Duration;
+
+    /// The serialization-only parameters (`version_information`, extra parameters) keep the
+    /// struct small enough to copy
+    #[test]
+    fn size() {
+        assert!(std::mem::size_of::<TransportParameters>() <= 640);
+    }
 
     #[test]
     fn coding() {
@@ -872,5 +1241,331 @@ mod test {
         };
         high_limit.validate_resumption_from(&low_limit).unwrap();
         low_limit.validate_resumption_from(&high_limit).unwrap_err();
+    }
+
+    /// Split encoded transport parameters into `(id, value)` pairs, in wire order
+    fn tlvs(mut buf: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        while buf.has_remaining() {
+            let id = buf.get_var().unwrap();
+            let len = buf.get_var().unwrap() as usize;
+            out.push((id, buf[..len].to_vec()));
+            buf.advance(len);
+        }
+        out
+    }
+
+    fn is_grease_version(version: &[u8]) -> bool {
+        version.len() == 4 && version.iter().all(|b| b & 0x0f == 0x0a)
+    }
+
+    fn encode(
+        transport: &TransportConfig,
+        endpoint: &EndpointConfig,
+        cid_len: usize,
+        rng: &mut impl RngCore,
+    ) -> (TransportParameters, Vec<u8>) {
+        let mut cid_gen = crate::RandomConnectionIdGenerator::new(cid_len);
+        let cid = cid_gen.generate_cid();
+        let params = TransportParameters::new(transport, endpoint, &cid_gen, cid, None, 1, rng);
+        let mut buf = Vec::new();
+        params.write(&mut buf);
+        (params, buf)
+    }
+
+    /// A received `version_information` is parsed leniently
+    #[test]
+    fn version_information_read() {
+        let mut buf = Vec::new();
+        for _ in 0..2 {
+            buf.write_var(VERSION_INFORMATION_ID);
+            buf.write_var(12);
+            for version in [1, QUIC_VERSION_2, 1] {
+                buf.write::<u32>(version);
+            }
+        }
+        let params = TransportParameters::read(Side::Server, &mut &buf[..14]).unwrap();
+        let info = params.version_information.unwrap();
+        assert!(info.is_valid());
+        assert_eq!(info.chosen(), 1);
+        assert!(info.lists(QUIC_VERSION_2));
+        // A repeated parameter is malformed but only rejected by version negotiation
+        let params = TransportParameters::read(Side::Server, &mut &buf[..]).unwrap();
+        assert!(!params.version_information.unwrap().is_valid());
+        // A client's chosen version must be available, a server's need not
+        let mut buf = Vec::new();
+        buf.write_var(VERSION_INFORMATION_ID);
+        buf.write_var(8);
+        buf.write::<u32>(QUIC_VERSION_2);
+        buf.write::<u32>(1);
+        let read = |side| {
+            let params = TransportParameters::read(side, &mut &buf[..]).unwrap();
+            params.version_information.unwrap().is_valid()
+        };
+        assert!(!read(Side::Server));
+        assert!(read(Side::Client));
+    }
+
+    /// Chrome 153's layout: shuffled order, one GREASE parameter, `version_information` with a
+    /// GREASE version at a random position, `google_connection_options`, no `min_ack_delay` and
+    /// no `grease_quic_bit`
+    #[test]
+    fn chrome_like_layout() {
+        let transport = crate::test_profiles::chrome_transport();
+        let endpoint = crate::test_profiles::chrome_endpoint();
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut orders = std::collections::HashSet::new();
+        let mut grease_positions = [0; 2];
+        for _ in 0..64 {
+            let (_, buf) = encode(&transport, &endpoint, 0, &mut rng);
+            let tlvs = tlvs(&buf);
+            orders.insert(tlvs.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+
+            let grease = tlvs
+                .iter()
+                .filter(|(id, _)| id % 31 == 27 && *id > 0x3128)
+                .collect::<Vec<_>>();
+            assert_eq!(grease.len(), 1);
+            assert!(grease[0].1.len() < 16);
+            let grease_len = VarInt(grease[0].0).size() + 1 + grease[0].1.len();
+
+            let mut expected: Vec<(u64, Vec<u8>)> = vec![
+                (0x01, vec![0x80, 0x00, 0x75, 0x30]),
+                (0x03, vec![0x45, 0xc0]),
+                (0x04, vec![0x80, 0xf0, 0x00, 0x00]),
+                (0x05, vec![0x80, 0x60, 0x00, 0x00]),
+                (0x06, vec![0x80, 0x60, 0x00, 0x00]),
+                (0x07, vec![0x80, 0x60, 0x00, 0x00]),
+                (0x08, vec![0x40, 0x64]),
+                (0x09, vec![0x40, 0x67]),
+                (0x0f, vec![]),
+                (0x20, vec![0x80, 0x01, 0x00, 0x00]),
+                (0x3128, b"ORIG".to_vec()),
+            ];
+            let mut actual = tlvs
+                .iter()
+                .filter(|(id, _)| *id != 0x11 && *id != grease[0].0)
+                .cloned()
+                .collect::<Vec<_>>();
+            actual.sort();
+            expected.sort();
+            assert_eq!(actual, expected);
+
+            let versions = &tlvs.iter().find(|(id, _)| *id == 0x11).unwrap().1;
+            assert_eq!(versions.len(), 12);
+            assert_eq!(versions[..4], [0, 0, 0, 1]);
+            match (&versions[4..8], &versions[8..]) {
+                (v, [0, 0, 0, 1]) if is_grease_version(v) => grease_positions[0] += 1,
+                ([0, 0, 0, 1], v) if is_grease_version(v) => grease_positions[1] += 1,
+                _ => panic!("unexpected version list {versions:x?}"),
+            }
+
+            // Chrome sends 86 bytes when its GREASE parameter has a six-byte value under an
+            // eight-byte ID
+            assert_eq!(buf.len() - grease_len, 86 - (8 + 1 + 6));
+        }
+        assert!(orders.len() > 60, "order must be random");
+        assert!(grease_positions.iter().all(|&n| n > 10));
+    }
+
+    /// Firefox 156's parameters, byte for byte apart from the random source connection ID and
+    /// GREASE version
+    #[test]
+    fn firefox_like_layout() {
+        let transport = crate::test_profiles::firefox_transport(1);
+        let endpoint = crate::test_profiles::firefox_endpoint();
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let (params, buf) = encode(&transport, &endpoint, 3, &mut rng);
+        let scid = params.initial_src_cid.unwrap();
+        let grease = &buf[55..59];
+        assert!(is_grease_version(grease));
+        #[rustfmt::skip]
+        let expected = [
+            &[0x01, 0x04, 0x80, 0x00, 0x75, 0x30][..],
+            &[0x04, 0x04, 0x81, 0x80, 0x00, 0x00],
+            &[0x05, 0x04, 0x80, 0xc0, 0x00, 0x00],
+            &[0x06, 0x04, 0x80, 0x10, 0x00, 0x00],
+            &[0x07, 0x04, 0x80, 0x10, 0x00, 0x00],
+            &[0x08, 0x02, 0x40, 0x64],
+            &[0x09, 0x02, 0x40, 0x64],
+            &[0x0b, 0x01, 0x14],
+            &[0x0e, 0x01, 0x08],
+            &[0x0f, 0x03], &scid,
+            &[0x11, 0x10, 0x00, 0x00, 0x00, 0x01], grease, &[0x6b, 0x33, 0x43, 0xcf, 0x00, 0x00, 0x00, 0x01],
+            &[0x1d, 0x00],
+            &[0xc0, 0x00, 0x00, 0x00, 0xff, 0x02, 0xde, 0x1a, 0x02, 0x43, 0xe8],
+            &[0x20, 0x04, 0x80, 0x00, 0xff, 0xff],
+        ]
+        .concat();
+        assert_eq!(buf, expected);
+        assert_eq!(buf.len(), 86);
+    }
+
+    /// Without a custom layout, parameters are shuffled with exactly the randomness upstream
+    /// Quinn uses
+    #[test]
+    fn default_layout_is_upstream() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let mut upstream_rng = rng.clone();
+        let (params, buf) = encode(
+            &TransportConfig::default(),
+            &EndpointConfig::default(),
+            8,
+            &mut rng,
+        );
+        ReservedTransportParameter::random(&mut upstream_rng);
+        let mut order: [u8; TransportParameterId::SUPPORTED.len()] =
+            std::array::from_fn(|i| i as u8);
+        order.shuffle(&mut upstream_rng);
+        let write_order = params.write_order.unwrap();
+        assert_eq!(write_order[..order.len()], order);
+        assert_eq!(rng.next_u64(), upstream_rng.next_u64());
+
+        let ids = tlvs(&buf).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        assert!(ids.contains(&MIN_ACK_DELAY_DRAFT07));
+        assert!(!ids.contains(&0x11));
+        assert_eq!(
+            ids.iter()
+                .filter(|id| *id % 31 == 27 && **id > 0x20)
+                .count(),
+            1
+        );
+    }
+
+    /// Safari's order: its parameters in one cyclic order from a random start, an unlisted one
+    /// last; `active_connection_id_limit` despite empty connection IDs
+    #[test]
+    fn rotated_order() {
+        let cycle = [0x01u64, 0x04, 0x05, 0x06, 0x07, 0x09, 0x0e, 0x0f];
+        let mut transport = TransportConfig::default();
+        transport.max_idle_timeout(None);
+        transport.active_connection_id_limit(Some(64));
+        transport.max_concurrent_bidi_streams(VarInt(0));
+        transport.datagram_receive_buffer_size(None);
+        let mut layout = TransportParameterLayout::default();
+        layout
+            .order(TransportParameterOrder::Rotated(
+                cycle.iter().map(|&id| VarInt(id)).collect(),
+            ))
+            .grease(false)
+            .connection_id_limit_with_empty_cid(true)
+            .min_ack_delay(None)
+            .unwrap()
+            .extra_parameter(VarInt(0xff08_0808), vec![7])
+            .unwrap();
+        transport.transport_parameter_layout(layout);
+        let mut endpoint = EndpointConfig::default();
+        endpoint.max_udp_payload_size(65527).unwrap();
+        endpoint.grease_quic_bit(false);
+        let mut starts = std::collections::HashSet::new();
+        for seed in 0..40 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let (_, buf) = encode(&transport, &endpoint, 0, &mut rng);
+            let ids = tlvs(&buf).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+            // Without max_idle_timeout: seven parameters of the cycle, the extra one last.
+            assert_eq!(ids.len(), 8, "{ids:x?}");
+            assert_eq!(ids[7], 0xff08_0808);
+            let sent: Vec<u64> = cycle.iter().copied().filter(|id| *id != 0x01).collect();
+            let start = sent.iter().position(|id| *id == ids[0]).unwrap();
+            let mut rotated = sent.clone();
+            rotated.rotate_left(start);
+            assert_eq!(ids[..7], rotated[..], "{ids:x?}");
+            starts.insert(ids[0]);
+        }
+        assert_eq!(starts.len(), 7, "every start occurs");
+    }
+
+    /// Unlisted parameters follow the listed ones in ascending order
+    #[test]
+    fn fixed_order_appends_unlisted() {
+        let mut transport = TransportConfig::default();
+        let mut layout = TransportParameterLayout::default();
+        layout.order(TransportParameterOrder::Fixed(vec![
+            VarInt::from_u32(0x20),
+            VarInt::from_u32(0x1234), // not sent
+            VarInt::from_u32(0x01),
+        ]));
+        transport.transport_parameter_layout(layout);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let (_, buf) = encode(&transport, &EndpointConfig::default(), 8, &mut rng);
+        let ids = tlvs(&buf).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        assert_eq!(ids[..2], [0x20, 0x01]);
+        assert!(ids[2..].windows(2).all(|w| w[0] < w[1]), "{ids:x?}");
+        // 0x01, 0x03 to 0x09, 0x0e, 0x0f, 0x20, grease_quic_bit, min_ack_delay and GREASE
+        assert_eq!(ids.len(), 14);
+    }
+
+    #[test]
+    fn layout_validation() {
+        let mut layout = TransportParameterLayout::default();
+        // Parameters Quinn writes itself
+        for id in [0x00, 0x05, 0x10, 0x11, 0x20, 0x2ab2] {
+            assert!(layout.extra_parameter(VarInt(id), Bytes::new()).is_err());
+        }
+        // The configured min_ack_delay codepoint
+        assert!(
+            layout
+                .extra_parameter(VarInt(MIN_ACK_DELAY_DRAFT07), Bytes::new())
+                .is_err()
+        );
+        assert!(
+            layout
+                .extra_parameter(VarInt(0x1d), vec![0; MAX_EXTRA_TRANSPORT_PARAMETER_LEN + 1])
+                .is_err()
+        );
+        layout.extra_parameter(VarInt(0x1d), Bytes::new()).unwrap();
+        assert!(layout.extra_parameter(VarInt(0x1d), Bytes::new()).is_err());
+        assert!(layout.min_ack_delay(Some(VarInt(0x1d))).is_err());
+        for id in 0..MAX_EXTRA_TRANSPORT_PARAMETERS as u64 - 1 {
+            layout
+                .extra_parameter(VarInt(0x4000 + id), Bytes::new())
+                .unwrap();
+        }
+        assert!(
+            layout
+                .extra_parameter(VarInt(0x5000), Bytes::new())
+                .is_err()
+        );
+
+        let mut versions = VersionInformation::new(vec![1; MAX_AVAILABLE_VERSIONS]);
+        assert!(layout.version_information(Some(versions.clone())).is_ok());
+        versions.grease(GreaseVersion::Random);
+        assert!(layout.version_information(Some(versions)).is_err());
+        let mut versions = VersionInformation::new(vec![1]);
+        versions.grease(GreaseVersion::At(2));
+        assert!(layout.version_information(Some(versions)).is_err());
+    }
+
+    /// The configured windows, `max_ack_delay` and connection ID limit are advertised
+    #[test]
+    fn transport_values() {
+        let mut transport = TransportConfig::default();
+        transport
+            .stream_receive_window_uni(Some(1000u32.into()))
+            .max_ack_delay(Duration::from_micros(20_500))
+            .active_connection_id_limit(Some(1));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let (params, _) = encode(&transport, &EndpointConfig::default(), 8, &mut rng);
+        assert_eq!(params.initial_max_stream_data_uni, VarInt(1000));
+        assert_eq!(
+            params.initial_max_stream_data_bidi_local,
+            transport.stream_receive_window
+        );
+        // Rounded up to whole milliseconds
+        assert_eq!(params.max_ack_delay, VarInt(21));
+        // Clamped to the minimum of 2, which is the default and therefore not sent
+        assert_eq!(params.active_connection_id_limit, VarInt(2));
+        // Zero-length connection IDs never advertise a limit
+        transport.active_connection_id_limit(Some(8));
+        let (params, _) = encode(&transport, &EndpointConfig::default(), 0, &mut rng);
+        assert_eq!(params.active_connection_id_limit, VarInt(2));
+        // Datagrams: the explicit size is capped by the receive buffer
+        transport
+            .datagram_receive_buffer_size(Some(1000))
+            .max_datagram_frame_size(Some(65_536u32.into()));
+        let (params, _) = encode(&transport, &EndpointConfig::default(), 8, &mut rng);
+        assert_eq!(params.max_datagram_frame_size, Some(VarInt(1000)));
     }
 }

@@ -65,7 +65,10 @@ pub(super) struct UnprotectHeaderResult {
     pub(super) stateless_reset: bool,
 }
 
-/// Decrypts a packet's body in-place
+/// Decrypts a packet's body in-place, or, with `already_decrypted`, confirms it without
+/// decrypting again: `packet.payload` is already the plaintext (see
+/// [`Connection::authenticates_initial`](super::Connection::authenticates_initial), the only
+/// producer of such a packet).
 pub(super) fn decrypt_packet_body(
     packet: &mut Packet,
     spaces: &[PacketSpace; 3],
@@ -73,6 +76,7 @@ pub(super) fn decrypt_packet_body(
     conn_key_phase: bool,
     prev_crypto: Option<&PrevCrypto>,
     next_crypto: Option<&KeyPair<Box<dyn PacketKey>>>,
+    already_decrypted: bool,
 ) -> Result<Option<DecryptPacketResult>, Option<TransportError>> {
     if !packet.header.is_protected() {
         // Unprotected packets also don't have packet numbers
@@ -109,12 +113,20 @@ pub(super) fn decrypt_packet_body(
         &next_crypto.unwrap().remote
     };
 
-    crypto
-        .decrypt(number, &packet.header_data, &mut packet.payload)
-        .map_err(|_| {
-            trace!("decryption failed with packet number {}", number);
-            None
-        })?;
+    if already_decrypted {
+        debug_assert_eq!(
+            space,
+            SpaceId::Initial,
+            "already-decrypted packets are only produced for a version-switch Initial"
+        );
+    } else {
+        crypto
+            .decrypt(number, &packet.header_data, &mut packet.payload)
+            .map_err(|_| {
+                trace!("decryption failed with packet number {}", number);
+                None
+            })?;
+    }
 
     if !packet.reserved_bits_valid() {
         return Err(Some(TransportError::PROTOCOL_VIOLATION(

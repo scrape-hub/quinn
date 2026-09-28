@@ -60,13 +60,16 @@ pub(crate) use web_time::{Duration, Instant};
 #[cfg(feature = "bloom")]
 pub use proto::BloomTokenLog;
 pub use proto::{
-    AckFrequencyConfig, ApplicationClose, Chunk, ClientConfig, ClosedStream, ConfigError,
-    ConnectError, ConnectionClose, ConnectionError, ConnectionId, ConnectionIdGenerator,
-    ConnectionStats, Dir, EcnCodepoint, EndpointConfig, FrameStats, FrameType, IdleTimeout,
-    MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PathStats, ServerConfig, Side, StdSystemTime,
-    StreamId, TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit,
-    TransportConfig, TransportErrorCode, UdpStats, ValidationTokenConfig, VarInt,
-    VarIntBoundsExceeded, Written, congestion, crypto,
+    AckDecimation, AckFrequencyConfig, AckPolicy, ApplicationClose, BufferedPacketProcessing,
+    Chunk, ClientConfig, ClosedStream, ConfigError, ConnectError, ConnectionClose, ConnectionError,
+    ConnectionId, ConnectionIdGenerator, ConnectionStats, CryptoFraming, Dir, EcnCodepoint,
+    EndpointConfig, FingerprintConfig, FirstPacketNumber, FrameStats, FrameType, GreaseVersion,
+    IdleTimeout, InitialPadding, MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore, PacketNumbering,
+    PacketPadding, PathStats, QUIC_VERSION_2, ServerConfig, Side, SpinBit, StdSystemTime, StreamId,
+    TimeSource, TokenLog, TokenMemoryCache, TokenReuseError, TokenStore, Transmit, TransportConfig,
+    TransportErrorCode, TransportParameterLayout, TransportParameterOrder, UdpStats,
+    ValidationTokenConfig, VarInt, VarIntBoundsExceeded, VersionInformation, Written, congestion,
+    crypto,
 };
 #[cfg(feature = "qlog")]
 pub use proto::{QlogConfig, QlogStream};
@@ -76,7 +79,7 @@ pub use udp;
 
 pub use crate::connection::{
     AcceptBi, AcceptUni, Connecting, Connection, OpenBi, OpenUni, ReadDatagram, SendDatagram,
-    SendDatagramError, ZeroRttAccepted,
+    SendDatagramError, TransmitHold, ZeroRttAccepted,
 };
 pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
